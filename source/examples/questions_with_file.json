@@ -1,0 +1,17 @@
+[
+  {
+    "id": "mock_file_001",
+    "title": "Mock 附件读取样例",
+    "description": "请调用 text_read_file 读取 files/mock_profile.txt。文件内容就是最终答案，只原样回答文件内容。",
+    "explanation": "用于验证题目 files 声明的附件可被程序读取；附件内容不会自动进入 prompt。",
+    "files": [
+      "files/mock_profile.txt"
+    ],
+    "level": 1,
+    "tools": [
+      "text_read_file"
+    ],
+    "skills": [],
+    "sub_agents": []
+  }
+]

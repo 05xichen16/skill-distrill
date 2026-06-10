@@ -1,0 +1,7 @@
+{
+  "name": "mock_review_agent",
+  "description": "Mock sub-agent that returns a fixed demo review result.",
+  "role": "mock reviewer",
+  "entrypoint": "scripts/run.py",
+  "timeout_seconds": 10
+}

@@ -1,0 +1,67 @@
+[
+  {
+    "id": "mock_direct_001",
+    "title": "Mock 直接回答样例",
+    "description": "请直接回答：mock demo ready",
+    "explanation": "用于验证主 Agent 能读取题面并返回最终答案。正式赛题中题目描述和答案要求可能变化。",
+    "files": [],
+    "level": 1,
+    "tools": [],
+    "skills": [],
+    "sub_agents": []
+  },
+  {
+    "id": "mock_file_001",
+    "title": "Mock 附件读取样例",
+    "description": "请调用 text_read_file 读取 files/mock_profile.txt。文件内容就是最终答案，只原样回答文件内容。",
+    "explanation": "用于验证题目 files 声明的附件可被程序读取；附件内容不会自动进入 prompt。",
+    "files": [
+      "files/mock_profile.txt"
+    ],
+    "level": 1,
+    "tools": [
+      "text_read_file"
+    ],
+    "skills": [],
+    "sub_agents": []
+  },
+  {
+    "id": "mock_mcp_001",
+    "title": "Mock MCP-style Tool 样例",
+    "description": "请调用 mock_order_lookup，order_id 使用 MOCK-1001，只回答工具返回 JSON 里的 mock_result。",
+    "explanation": "用于验证主 Agent 能发现并调用示例 MCP-style tool。",
+    "files": [],
+    "level": 1,
+    "tools": [
+      "mock_order_lookup"
+    ],
+    "skills": [],
+    "sub_agents": []
+  },
+  {
+    "id": "mock_skill_001",
+    "title": "Mock Skill 样例",
+    "description": "请先调用 skill_load，参数 name 为 mock_summary_skill；再调用 skill_run，参数 name 为 mock_summary_skill，arguments 为 {\"text\":\"alpha beta gamma\"}。只回答 skill_run 返回 JSON 里的 mock_result。",
+    "explanation": "用于验证主 Agent 能加载并运行示例 Skill。",
+    "files": [],
+    "level": 1,
+    "tools": [],
+    "skills": [
+      "mock_summary_skill"
+    ],
+    "sub_agents": []
+  },
+  {
+    "id": "mock_sub_agent_001",
+    "title": "Mock Sub-agent 样例",
+    "description": "请调用 agent_delegate，agent_name 为 mock_review_agent，task 为 review mock payload。只回答 sub-agent 返回 JSON 里的 mock_result。",
+    "explanation": "用于验证主 Agent 能委托示例 sub-agent 并读取返回结果。",
+    "files": [],
+    "level": 1,
+    "tools": [],
+    "skills": [],
+    "sub_agents": [
+      "mock_review_agent"
+    ]
+  }
+]

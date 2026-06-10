@@ -1,0 +1,17 @@
+{
+  "name": "mock_summary_skill",
+  "description": "Mock skill that returns a fixed demo result.",
+  "entrypoint": "scripts/run.py",
+  "timeout_seconds": 10,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "text": {
+        "type": "string",
+        "description": "Mock text input."
+      }
+    },
+    "required": ["text"],
+    "additionalProperties": false
+  }
+}
