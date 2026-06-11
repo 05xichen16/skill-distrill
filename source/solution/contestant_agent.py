@@ -42,6 +42,11 @@ class ContestantAgent:
 
     async def solve(self, *, question: dict[str, Any], context: AgentContext) -> str:
         load_dotenv()
+
+        routed = await self._try_explicit_skill_route(question=question, context=context)
+        if routed is not None:
+            return routed
+
         if not env_bool("AGENT_DEMO_USE_LLM", True):
             raise RuntimeError("AGENT_DEMO_USE_LLM is disabled; configure a model gateway or implement ContestantAgent.solve().")
 
@@ -76,6 +81,254 @@ class ContestantAgent:
         except Exception as exc:  # last-resort safety net: never return an empty answer
             print(f"agent loop failed, falling back to direct answer: {exc}", file=sys.stderr)
             return await self._direct_answer(user_content, enable_thinking=enable_thinking)
+
+    async def _try_explicit_skill_route(self, *, question: dict[str, Any], context: AgentContext) -> str | None:
+        """Run high-confidence contest tasks through their dedicated skill.
+
+        The old generic model loop is still the fallback, but these tasks have
+        position-sensitive graders and established executable skills. Letting
+        the model decide whether to call a skill is a major source of drift.
+        """
+
+        route = self._explicit_skill_route(question=question, context=context)
+        if route is None:
+            return None
+
+        skill_name, arguments = route
+        try:
+            result = await context.call_tool(
+                "skill_run",
+                {
+                    "name": skill_name,
+                    "arguments": arguments,
+                },
+            )
+        except Exception as exc:
+            print(f"explicit skill route failed for {skill_name}: {exc}", file=sys.stderr)
+            return None
+
+        answer = self._extract_skill_answer(result)
+        if answer is None:
+            print(f"explicit skill route {skill_name} returned no answer field", file=sys.stderr)
+            return None
+        return answer
+
+    def _explicit_skill_route(
+        self,
+        *,
+        question: dict[str, Any],
+        context: AgentContext,
+    ) -> tuple[str, dict[str, Any]] | None:
+        available = self._available_skill_names(context)
+        text = self._route_text(question)
+        question_text = str(question.get("question") or "")
+        files = self._question_files(question)
+        basenames = {self._basename(path).lower() for path in files}
+
+        def has(skill_name: str) -> bool:
+            return skill_name in available
+
+        if has("interface_test") and (
+            "接口测试" in text
+            or {"api_doc.md", "test_cases.json", "auth_config.json"}.issubset(basenames)
+        ):
+            args: dict[str, Any] = {"task_description": question_text}
+            doc_dir = self._common_parent_for_basenames(
+                files,
+                {"api_doc.md", "test_cases.json", "auth_config.json"},
+            )
+            if doc_dir:
+                args["doc_dir"] = doc_dir
+            return "interface_test", args
+
+        if has("date_normalize") and (
+            "日期提取" in text
+            or "日期标准化" in text
+            or any(self._basename(path).lower() == "customer_date_messages.txt" for path in files)
+        ):
+            args = {}
+            message_file = self._find_declared_file(files, (".txt",))
+            if message_file:
+                args["message_file"] = message_file
+            return "date_normalize", args
+
+        if has("system_issue_locator") and (
+            "系统问题定位" in text
+            or {"network.har", "form_schema.json", "frontend_log.log", "backend_validation.log"}.issubset(basenames)
+        ):
+            args = {}
+            source_dir = self._common_parent_for_basenames(
+                files,
+                {"network.har", "form_schema.json", "frontend_log.log", "backend_validation.log"},
+            )
+            if source_dir:
+                args["source_dir"] = source_dir
+            return "system_issue_locator", args
+
+        if has("wiki_dialog") and (
+            "ide 插件 fse" in text.lower()
+            or "ide插件fse" in text.lower()
+            or {"persona.md", "chat_history.db", "source_access.json", "dialog_tests_complex.json"}.issubset(basenames)
+        ):
+            args = {"task_description": question_text}
+            source_dir = self._common_parent_for_basenames(
+                files,
+                {"persona.md", "chat_history.db", "source_access.json", "dialog_tests_complex.json"},
+            )
+            if source_dir:
+                args["source_dir"] = source_dir
+            return "wiki_dialog", args
+
+        if has("prompt_learn_classify") and (
+            "提示词学习" in text
+            or (
+                self._find_declared_dir(files, ("训练", "train"))
+                and self._find_declared_dir(files, ("验证", "val", "valid"))
+            )
+        ):
+            args = {"task_description": question_text}
+            train_dir = self._find_declared_dir(files, ("训练", "train"))
+            val_dir = self._find_declared_dir(files, ("验证", "val", "valid"))
+            if train_dir:
+                args["train_dir"] = train_dir
+            if val_dir:
+                args["val_dir"] = val_dir
+            return "prompt_learn_classify", args
+
+        if has("sensitive_scan") and (
+            "敏感信息" in text
+            or "sensitive" in text.lower()
+        ):
+            zip_path = self._find_declared_file(files, (".zip",))
+            if zip_path:
+                return "sensitive_scan", {"zip_path": zip_path}
+
+        if has("java_tax_calculator") and (
+            "个人所得税" in text
+            or self._find_declared_file(files, (".java",))
+        ):
+            args = {"task_description": question_text}
+            source_file = self._find_declared_file(files, (".java",))
+            if source_file:
+                args["source_file"] = source_file
+            return "java_tax_calculator", args
+
+        if has("po_compliance_audit") and (
+            "采购po合规" in text.lower()
+            or "采购 po 合规" in text.lower()
+            or any("采购PO合规审计" in path or "采购po合规审计" in path.lower() for path in files)
+        ):
+            args = {}
+            source_dir = self._find_declared_dir(files, ("采购PO合规审计", "采购po合规审计", "po"))
+            if source_dir:
+                args["source_dir"] = source_dir
+            return "po_compliance_audit", args
+
+        if has("purchase_clean_summary") and (
+            "采购数据清洗" in text
+            or any("采购数据清洗与汇总" in path for path in files)
+        ):
+            args = {}
+            source_dir = self._find_declared_dir(files, ("采购数据清洗与汇总", "purchase"))
+            if source_dir:
+                args["source_dir"] = source_dir
+            return "purchase_clean_summary", args
+
+        if has("spec_qa") and (
+            "编程规范" in text
+            or any("编程规范" in path for path in files)
+        ):
+            args = {"task_description": question_text}
+            spec_dir = self._find_declared_dir(files, ("编程规范", "spec", "standard"))
+            if spec_dir:
+                args["spec_dir"] = spec_dir
+            return "spec_qa", args
+
+        return None
+
+    def _available_skill_names(self, context: AgentContext) -> set[str]:
+        names: set[str] = set()
+        for item in context.available_skills:
+            if isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+                if name:
+                    names.add(name)
+            elif item:
+                names.add(str(item).strip())
+        return names
+
+    def _extract_skill_answer(self, result: Any) -> str | None:
+        if isinstance(result, str):
+            text = result.strip()
+        else:
+            text = json.dumps(result, ensure_ascii=False)
+
+        parsed = self._parse_json_object(text)
+        if isinstance(parsed, dict):
+            if "answer" not in parsed:
+                return None
+            value = parsed.get("answer")
+            return self._clean_final_answer("" if value is None else str(value))
+        if text:
+            return self._clean_final_answer(text)
+        return None
+
+    def _route_text(self, question: dict[str, Any]) -> str:
+        pieces = [
+            str(question.get("id") or ""),
+            str(question.get("title") or ""),
+            str(question.get("question") or ""),
+            str(question.get("explanation") or ""),
+            " ".join(self._question_files(question)),
+        ]
+        return "\n".join(piece for piece in pieces if piece)
+
+    def _question_files(self, question: dict[str, Any]) -> list[str]:
+        files = question.get("files") or []
+        if not isinstance(files, list):
+            return []
+        return [str(item).replace("\\", "/").strip() for item in files if str(item).strip()]
+
+    def _find_declared_file(self, files: list[str], suffixes: tuple[str, ...]) -> str | None:
+        lower_suffixes = tuple(suffix.lower() for suffix in suffixes)
+        for path in files:
+            clean = path.rstrip("/")
+            if clean.lower().endswith(lower_suffixes):
+                return clean
+        return None
+
+    def _find_declared_dir(self, files: list[str], hints: tuple[str, ...]) -> str | None:
+        lowered_hints = tuple(hint.lower() for hint in hints)
+        for path in files:
+            clean = path.rstrip("/")
+            base = self._basename(clean).lower()
+            if any(hint in clean.lower() or hint in base for hint in lowered_hints):
+                return clean
+        return None
+
+    def _common_parent_for_basenames(self, files: list[str], required_basenames: set[str]) -> str | None:
+        parents: dict[str, set[str]] = {}
+        for path in files:
+            clean = path.rstrip("/")
+            basename = self._basename(clean).lower()
+            if basename not in required_basenames:
+                continue
+            parent = self._parent(clean)
+            parents.setdefault(parent, set()).add(basename)
+        for parent, found in parents.items():
+            if required_basenames.issubset(found):
+                return parent
+        return None
+
+    def _basename(self, path: str) -> str:
+        return path.rstrip("/").rsplit("/", 1)[-1]
+
+    def _parent(self, path: str) -> str:
+        clean = path.rstrip("/")
+        if "/" not in clean:
+            return ""
+        parent = clean.rsplit("/", 1)[0].rstrip("/")
+        return parent or "."
 
     def _should_enable_thinking(self, question: dict[str, Any]) -> bool:
         """Routing hook for the thinking/token-and-latency trade-off.

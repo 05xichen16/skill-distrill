@@ -1,0 +1,16 @@
+{
+  "name": "po_compliance_audit",
+  "description": "Audit completed high-value purchase orders for vendor service-scope coverage and valid VP approval, returning non-compliant PO ids sorted ascending.",
+  "entrypoint": "scripts/run.py",
+  "timeout_seconds": 60,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "source_dir": {
+        "type": "string",
+        "description": "Directory containing purchase_orders_raw.csv, vendors.csv, people_roles.csv, approval_evidence.csv and attachments/. Optional; inferred from declared files."
+      }
+    },
+    "additionalProperties": true
+  }
+}

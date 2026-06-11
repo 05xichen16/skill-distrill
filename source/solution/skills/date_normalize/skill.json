@@ -1,0 +1,16 @@
+{
+  "name": "date_normalize",
+  "description": "Parse a customer-message text file line by line and return normalized yyyy-mm-dd dates joined by commas.",
+  "entrypoint": "scripts/run.py",
+  "timeout_seconds": 30,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "message_file": {
+        "type": "string",
+        "description": "Path to the declared text file containing one customer message per line. Relative paths resolve against the question directory."
+      }
+    },
+    "additionalProperties": true
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "system_issue_locator",
+  "description": "Link frontend logs, HAR responses and backend validation logs to output the failing module, API path and mapped root causes.",
+  "entrypoint": "scripts/run.py",
+  "timeout_seconds": 30,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "source_dir": {
+        "type": "string",
+        "description": "Directory containing frontend_log.log, backend_validation.log, network.har and form_schema.json. Optional; inferred from declared files."
+      }
+    },
+    "additionalProperties": true
+  }
+}

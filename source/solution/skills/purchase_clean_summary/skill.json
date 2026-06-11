@@ -1,0 +1,20 @@
+{
+  "name": "purchase_clean_summary",
+  "description": "Clean purchase orders using vendor master data, category taxonomy, invoices/contracts/chat evidence and return query totals in order.",
+  "entrypoint": "scripts/run.py",
+  "timeout_seconds": 900,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "source_dir": {
+        "type": "string",
+        "description": "Directory containing purchase_orders_raw.csv, vendors.csv, category_taxonomy.csv, attachment_manifest.csv and queries.csv. Optional; inferred from declared files."
+      },
+      "do_ocr": {
+        "type": "boolean",
+        "description": "Whether to OCR image attachments through the model gateway. Defaults to true."
+      }
+    },
+    "additionalProperties": true
+  }
+}

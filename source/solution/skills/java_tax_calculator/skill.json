@@ -1,0 +1,21 @@
+{
+  "name": "java_tax_calculator",
+  "description": "Decode the Java tax calculator source parameters and compute the hidden salary outputs with a java-version prefix.",
+  "entrypoint": "scripts/run.py",
+  "timeout_seconds": 30,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "task_description": {
+        "type": "string",
+        "description": "The question text, including the hidden salary cases."
+      },
+      "source_file": {
+        "type": "string",
+        "description": "Path to the declared Java source file. Relative paths resolve against the question directory."
+      }
+    },
+    "required": ["task_description"],
+    "additionalProperties": true
+  }
+}
