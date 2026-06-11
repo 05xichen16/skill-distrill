@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 6
-- **Last Active**: 2026-06-11
+- **Total Sessions**: 7
+- **Last Active**: 2026-06-12
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~207 | Active |
+| `journal-1.md` | ~240 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 7 | 2026-06-12 | 单题探针开关 AGENT_DEMO_ONLY_QUESTION_IDS | `8490d98` | `develop` |
 | 6 | 2026-06-11 | 修复 2_3/3_2 skill 超时归零: 预算修正+deadline 自保+router 出口门禁 | `5dfc45f`, `b5be787` | `develop` |
 | 5 | 2026-06-11 | 补 interface_test(1_4)+wiki_dialog(3_3) skill,端到端实测+6.33/7 | `8d254f1` | `develop` |
 | 4 | 2026-06-11 | 关thinking默认+题级并发=3:修1小时只跑完4/10题 | `16aa96a` | `develop` |

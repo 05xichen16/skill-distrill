@@ -205,3 +205,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 7: 单题探针开关 AGENT_DEMO_ONLY_QUESTION_IDS
+
+**Date**: 2026-06-12
+**Task**: 单题探针开关 AGENT_DEMO_ONLY_QUESTION_IDS
+**Branch**: `develop`
+
+### Summary
+
+为平台逐题排查策略落地探针开关: 任务书 378-383 核实「重复提交取最新一次分数, 提交次数仅第三层 tiebreaker」, 故单题探针提交近乎零成本。batch_runner._run_one 单点拦截(串行/并发共用), 白名单外题目瞬间返回空串、零 context/模型/skill 成本, results.json 仍含全部 id。双防呆: 激活横幅 + 白名单全拼错(交集空)警告并回退全量, 杜绝手滑全空提交清零榜上分; .env 注释示例含收官纪律(最后一笔必须全量)。trellis-check 复核通过并补 1 个部分匹配分支测试, pytest 194 passed(+6, 0 回归)。排查序建议: 2_3→3_2→3_3→2_2→1_4, 每题修复证实后做一次全量落袋提交。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8490d98` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
