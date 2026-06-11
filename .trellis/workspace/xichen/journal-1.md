@@ -105,3 +105,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 4: 关thinking默认+题级并发=3:修1小时只跑完4/10题
+
+**Date**: 2026-06-11
+**Task**: 关thinking默认+题级并发=3:修1小时只跑完4/10题
+**Branch**: `develop`
+
+### Summary
+
+正式环境实测撞任务书§281的1小时运行上限,10题只跑完4题(6题空答)。根因:.env AGENT_DEMO_ENABLE_THINKING=1使每次模型调用~10×慢且被skill子进程继承(prompt_learn_classify逐张分类≈100次调用)+CONCURRENCY=1串行。修复:全局关thinking(默认False+按题白名单AGENT_DEMO_THINKING_QUESTION_IDS路由)、env_config默认对齐、题级并发=3(skill worker维持4,峰值~12)。验证:53单测passed+回归台exit0(白送分守住)+并发分支确认。真机提速待生产验证;网关限流则CONCURRENCY调2。墙钟软截止兜底留作fast-follow。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `16aa96a` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
