@@ -10,3 +10,7 @@ source/outputs/*.json
 # Local contest materials — questions/attachments/sensitive data, NOT for the remote
 publish/
 real_questions*.json
+
+# Local-only model endpoints (e.g. DashScope test key) — never commit secrets
+.env.dashscope
+.env.local
