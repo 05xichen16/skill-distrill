@@ -1,0 +1,5 @@
+{"file": ".trellis/tasks/06-11-1-4-3-3wiki-skill-7/research/1_4-interface.md", "reason": "1_4 服务契约/端点/pass-fail判定/package_id/token规则/输出格式 + skill施工路径"}
+{"file": ".trellis/tasks/06-11-1-4-3-3wiki-skill-7/research/3_3-wiki.md", "reason": "3_3 wiki/sqlite契约/候选池/选源规则/30答案反向追溯 + skill施工路径"}
+{"file": ".trellis/tasks/06-11-1-4-3-3wiki-skill-7/research/grading-semantics.md", "reason": "ratio(位置敏感)与list_equal(逐元素全等)精确判分语义=输出硬约束"}
+{"file": ".trellis/tasks/06-11-1-4-3-3wiki-skill-7/research/skill-template-notes.md", "reason": "照搬spec_qa范式:目录/skill.json/_runtime/模型调用/编码IO/降级/纯标准库"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "新skill代码质量/可读性/命名约束"}

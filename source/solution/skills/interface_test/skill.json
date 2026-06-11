@@ -1,0 +1,21 @@
+{
+  "name": "interface_test",
+  "description": "Interface test-case verifier: run every test case in test_cases.json against a real HTTP service (calling the documented endpoints in order, getting a write token before each write step) and return the comma-joined IDs of the FAILING cases, in test_cases order. Generic - the base URL, token endpoint/body/path, package-id header, the cases, their assertions and the endpoint catalogue are all read from the input files (test_cases.json / api_doc.md / auth_config.json), never hard-coded. The model only translates each case's natural-language description into structured HTTP steps; the pass/fail assertion (status + field presence + exact values) is done in code.",
+  "entrypoint": "scripts/run.py",
+  "timeout_seconds": 600,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "task_description": {
+        "type": "string",
+        "description": "The question text, verbatim. Carries the task framing; the actual cases, endpoints and auth config are read from the declared input files."
+      },
+      "doc_dir": {
+        "type": "string",
+        "description": "Name (or path) of the directory holding test_cases.json, api_doc.md and auth_config.json. Relative names resolve against the question directory. Optional; inferred from the question's declared files when omitted."
+      }
+    },
+    "required": ["task_description"],
+    "additionalProperties": true
+  }
+}

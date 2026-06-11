@@ -1,0 +1,21 @@
+{
+  "name": "wiki_dialog",
+  "description": "FSE persona Wiki-dialog Q&A: for each dialog, emit 'id=>persona_phrase|||reply|||service_action' and return the elements as a JSON array text in dialog order. reply and service_action are taken VERBATIM from authoritative sources (annotated chat_history.db messages and keyed Wiki FAQ answers); persona_phrase is code-generated from the persona naming rule. The model is used only to SELECT which pre-loaded candidate best matches a question (it returns an index, never authors text), so the list_equal grader's exact-element match holds. Generic - dialog count, candidate pool, key->action map and naming rule are all derived from the inputs, never hard-coded.",
+  "entrypoint": "scripts/run.py",
+  "timeout_seconds": 900,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "task_description": {
+        "type": "string",
+        "description": "The question text, verbatim. Used as context; the dialogs, persona rule, action map and Wiki contract are read from the declared input files."
+      },
+      "source_dir": {
+        "type": "string",
+        "description": "Name (or path) of the IDE-plugin-FSE directory holding persona.md, chat_history.db, source_access.json and dialog_tests_complex.json. Relative names resolve against the question directory. Optional; inferred from the question's declared files when omitted."
+      }
+    },
+    "required": ["task_description"],
+    "additionalProperties": true
+  }
+}

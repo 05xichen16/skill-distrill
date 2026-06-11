@@ -1,0 +1,5 @@
+{"file": ".trellis/tasks/06-11-1-4-3-3wiki-skill-7/research/grading-semantics.md", "reason": "验收对照:ratio/list_equal输出硬约束(分隔符/位置/逐字全等)"}
+{"file": ".trellis/tasks/06-11-1-4-3-3wiki-skill-7/research/1_4-interface.md", "reason": "验收1_4:真调接口/断言判定/失败ID按序/不多报"}
+{"file": ".trellis/tasks/06-11-1-4-3-3wiki-skill-7/research/3_3-wiki.md", "reason": "验收3_3:候选池/原文取用/persona/key_map/零硬编码"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "skill代码质量门槛"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "服务不可达/配置缺失/单点失败的降级健壮性"}

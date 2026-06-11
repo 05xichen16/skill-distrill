@@ -7,6 +7,10 @@ venv/
 # Contest run outputs (keep the .gitkeep placeholder)
 source/outputs/*.json
 
+# Root-level local run artifacts (result files + run logs) — generated, never commit
+result*.json
+*.log
+
 # Local contest materials — questions/attachments/sensitive data, NOT for the remote
 publish/
 real_questions*.json
