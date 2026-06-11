@@ -1,0 +1,28 @@
+附件是华为编程规范集，包含以下多个规范文档：请根据各规范回答以下问题：
+
+【Java规范】
+Q1: Java源文件的import排序中，华为公司包（com.huawei.*）应该在哪一类之后？
+Q2: What suffix should be used for long type numeric literals in Java?
+
+【Python规范】
+Q3: Python中导入模块应该按照什么顺序排列？
+Q4: In Python, which operator should be used when comparing with None?
+
+【C++规范】
+Q5: C++源文件和头文件的扩展名分别是什么？
+Q6: In C++, should copy constructor and copy assignment operator be declared together or separately?
+
+【JS/TS规范】
+Q7: JavaScript/TypeScript中构造器函数和类应该采用什么命名风格？
+Q8: In JavaScript/TypeScript, which operators should be used for equality comparison?
+
+【Web安全规范】
+Q9: Web应用中口令输入框的type属性应该设置为什么值？
+Q10: In Web applications, what attribute should session cookies have to prevent XSS attack reading?
+
+重要提示：即使问题以英文提问，答案也必须遵循规范文档中的原文内容，而非英文翻译。
+
+返回格式：所有问题答案用英文分号分隔，按Q1~Q10顺序返回。
+
+【返回格式示例】
+Q1答案;Q2答案;Q3答案;Q4答案

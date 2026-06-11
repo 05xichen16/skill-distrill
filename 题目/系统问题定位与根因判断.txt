@@ -1,0 +1,23 @@
+某系统管理平台出现一次页面操作失败，需要根据页面记录、前端日志、后端校验日志、网络抓包和校验规则等材料，判断问题最可能出现在哪个模块、涉及哪个接口，以及最可能的一个或多个根因。
+
+【输入文件】
+- defect_screenshots.zip：问题发生前后的页面截图材料，用于确认可见页面、操作对象、页面时间或页面上的定位标识
+- frontend_log.log：前端运行日志，可能包含 actionId、requestId、traceId、pageTime、pageGroup、displayObject、screenshotFile、前端适配器或提交结果
+- backend_validation.log：后端校验日志，可能包含 validationRef、requestId、traceId、stage、source、validationCode、fieldPath、schemaVersion 或校验结果
+- network.har：浏览器网络抓包记录，可能包含真实接口、请求/响应体、请求头、状态码、actionId、requestId、traceId 或 validationRef
+- form_schema.json：校验码、字段、阶段、模块或 schemaVersion 与根因关键词之间的映射和过滤规则
+
+【你的任务】
+请先把所有输入材料抽取为证据池，识别可能的页面记录、前端事件、网络请求、后端校验、最终失败呈现和根因规则。最终答案必须来自同一条完整前台作业流：该链路需要能连续关联页面记录、前端人工提交事件、网络请求、后端校验结果和最终可见失败呈现。
+日志、HAR 和后端校验中可能同时存在多个失败、相似截图、相邻重试、诊断回放、预校验、静态资源异常或后台任务候选。只有局部字段能关联、只有相似截图、只属于重试/回放/诊断/后台处理，或不能串起完整前台作业流的候选，不得作为最终答案依据。
+不同题目中可用的入口文件、关联字段和有效校验范围可能不同，不要预设固定文件顺序，也不要预设一定通过 actionId 或 validationRef 关联。请按当前输入文件中的 form_schema.json 决定校验码如何过滤和映射，不要预设所有题目使用同一种过滤方式：
+- 若 form_schema.json 只有 validationCodeMap：先锁定完整前台作业流，再将该链路下的 validationCode 通过 validationCodeMap 映射为根因关键词。
+- 若 form_schema.json 存在 effectiveValidationRule：只有同时满足该规则字段要求的 validationCode 才有效；同一链路下不满足规则的预校验、诊断上报或噪声校验码应排除。
+- 若 form_schema.json 存在 rootCauseRules：需要按规则中的 module、validationCode、fieldPath、schemaVersion 等条件匹配，匹配成功的 rootCause 才输出。
+同一完整前台作业流下，凡是有效 validationCode 能映射到根因关键词的，都必须全部输出。
+
+【返回格式】
+仅返回一个字符串，格式为：缺陷模块,异常接口,根因关键词。多个根因关键词之间使用中文顿号“、”连接，不要输出解释。
+
+【样例输出】
+示例模块,/api/example/action,接口路径配置错误

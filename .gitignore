@@ -18,3 +18,5 @@ real_questions*.json
 # Local-only model endpoints (e.g. DashScope test key) — never commit secrets
 .env.dashscope
 .env.local
+
+/题目

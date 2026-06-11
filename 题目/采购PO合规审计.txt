@@ -1,0 +1,12 @@
+请审计 purchase_orders_raw.csv 中的全部 PO，根据 vendors.csv、people_roles.csv、approval_evidence.csv 和 audit_rules.md，并阅读 approval_evidence.csv 中 file_path 指向的附件正文，判断哪些 PO 不合规。
+
+请输出一个逗号分隔的 po_id 字符串，po_id 按升序排列；如果没有不合规 PO，输出空字符串。不要输出解释。
+
+审计规则：
+1. 先做状态筛选：只审计状态语义明确表示已结束、已完成、已支付、已验收、已关闭或已结案的 PO。草稿、评审中、审批中、待补件、取消、作废等未结束或已取消/作废状态不进入审计。状态字段可能使用中英文表达，请按状态语义判断，不要假设题面列出了全部取值。
+2. 再做金额筛选：只有状态有效且 amount_cny 达到或超过 50000 CNY 的 PO 才进入合规深审；状态无效或金额低于阈值的 PO 不输出。
+3. 深审 PO 必须同时满足供应商服务范围覆盖和 VP 审批有效；任一项不满足，则该 PO 不合规。
+4. 供应商校验：vendor_id 和 vendor_name 已经给出，不考察简称猜测。需要判断 PO 的 service_items 是否全部属于 vendors.csv 中该供应商的 service_scope。
+5. VP 审批校验：只接受 VP 的明确审批。需要根据审批邮件发件人邮箱匹配 people_roles.csv，确认该人员在审批日期的 role 为 VP，且审批日期处于该 VP 身份有效期内，并且不晚于 po_date。Director、Manager、VP Assistant 或过期 VP 都不算有效 VP 审批。
+6. 审批内容校验：附件可能是一封邮件，也可能是多轮转发/追问。有效审批必须明确覆盖当前 PO，并明确批准当前 PO 的全部 service_items。邮件中的“考虑一下”“先评估”“待补材料”“只批准其中一项”“剩余项另行确认”等不算完整有效审批；审批其他 PO 的邮件也不能覆盖当前 PO。
+7. 本题只需判断 PO 级不合规，不需要输出任何项目或分组结果。附件日期可能有多种常见格式，需要按自然语言日期理解。

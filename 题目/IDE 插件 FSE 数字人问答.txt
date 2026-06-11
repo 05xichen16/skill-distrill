@@ -1,0 +1,30 @@
+某企业内部使用 DevPilot IDE 插件，需要根据 FSE 人设、历史处理记录和 Wiki 资料，回答插件使用与支撑过程中的相关问题。
+
+【输入文件】
+- persona.md：FSE 数字人的人设、称呼和服务表达要求
+- chat_history.db：SQLite 数据库文件，存放历史问题处理记录
+- source_access.json：本地 Wiki 服务的访问入口、接口路径、页面入口和 service_action 可选项
+- dialog_tests_complex.json：需要按顺序回答的问题列表
+
+【本地服务】
+本地 Wiki 服务地址为 http://127.0.0.1:18080。服务程序由单独的 Wiki 服务包提供，启动后请根据 source_access.json 访问页面、搜索资料或提交更新建议。
+
+【你的任务】
+请根据 persona.md、chat_history.db、source_access.json 和 Wiki 服务资料，回答 dialog_tests_complex.json 中所有问题。每个问题都需要输出固定格式的结果，结果由题目 ID、称呼、人设化回答内容和服务动作组成。若题目涉及 Wiki 资料更新建议，请按 source_access.json 中提供的接口提交。
+
+【资料使用与来源规则】
+请以实际输入文件和本地 Wiki 服务查询结果为准，不要直接套用公开样例中的固定结论；
+回答时需要同时关注 FSE 人设要求、历史处理经验、Wiki 资料内容和 service_action 可选项；
+若资料之间存在差异，请结合题目上下文和可查询资料选择合适处理方式；
+最终结果应严格按照题目要求的 JSON 数组文本格式输出。
+若资料存在 DB/Wiki 双源或不同时间线冲突，需要依据题目上下文、Wiki 返回资料和数据库历史记录选择来源；最终 reply 仍必须取选中来源原文。
+service_action 的唯一依据是选中来源的 service_action_key 与 source_access.service_action_key_map；后续题目可能调整 action key、Wiki 页面、DB 元数据、材料顺序或检索线索。
+Wiki search/list 结果只是候选页面信息，最终 reply 和 service_action_key 需以 get_page 返回的 FAQ 详情为准。
+
+【返回格式】
+最终 answer 仅返回 JSON 数组文本，不要输出解释。数组元素必须按 dialog_tests_complex.json 中问题出现顺序排列。每个数组元素格式固定为：题目ID=>persona_phrase|||reply|||service_action。reply 必须与输入资料中可获取的 Wiki FAQ a 字段或 chat_history.db 的 messages.content 原文完全一致；service_action 必须与 source_access.json 的 service_action_options 原文完全一致。reply 和 service_action 不得由模型总结、改写、补充、删减或翻译，任何不一致均不得分。reply 可能为中文、英文或中英混合，必须以来源原文为准，不得翻译。每个元素必须且只能包含一个 => 和两个 |||，persona_phrase、reply、service_action 内部不得包含 =>、||| 或换行符。
+
+【样例输出】
+[\"示例题ID=>您好示例总|||示例处理口径|||标准答复\"]
+
+【service_action 取值规则】service_action 必须先从所选 reply 来源记录的 service_action_key 获取 key，再通过 source_access.json 的 service_action_key_map 映射到具体动作，且映射结果必须与 source_access.json 的 service_action_options 中某一项完全一致。不得根据题目 ID、题目字段名、公开样例顺序或模型语义自行推断 service_action
