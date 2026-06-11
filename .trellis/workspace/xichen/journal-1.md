@@ -171,3 +171,37 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 6: 修复 2_3/3_2 skill 超时归零: 预算修正+deadline 自保+router 出口门禁
+
+**Date**: 2026-06-11
+**Task**: 修复 2_3/3_2 skill 超时归零: 预算修正+deadline 自保+router 出口门禁
+**Branch**: `develop`
+
+### Summary
+
+本地全量验证定位两处 skill route failed 根因: po_compliance_audit 60s 超时是纯代码版遗留(混合 LLM 版 14 PO 深审必死), java_tax_calculator 240s 兜不住 3 轮修复循环最坏情况; 外层 subprocess kill 导致脚本内兜底无机会输出, 3_2 落 model loop 后提交 4096 截断裸 CoT(model loop 出口零门禁)。任务书核实平台仅 1h 总限无每题时限。修复: 超时 600/480 + skill_runtime 注入 SKILL_BUDGET_SECONDS + 两脚本 deadline 自保 + model loop 出口复用 _skill_answer_guard(拒则严格重试一次) + 新增 po shape guard + finish_reason=length 不作终答 + skill 内 _call_model 5xx 重试 + 每题耗时日志。实测 po skill 真实端点 150.4s/8-9 gold, pytest 188 passed(+16, 0 回归)。用户要求跳过 trellis-check。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `5dfc45f` | (see git log) |
+| `b5be787` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
