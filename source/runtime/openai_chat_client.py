@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import http.client
 import json
+import socket
+import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -10,6 +13,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from source.runtime.env_config import ModelConfig
+
+
+class _RetryableGatewayError(Exception):
+    """Transient gateway error worth retrying (5xx / timeout / connection drop)."""
 
 
 @dataclass
@@ -23,6 +30,7 @@ class ChatCompletionClient:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str = "auto",
         response_format: dict[str, Any] | None = None,
+        enable_thinking: bool | None = None,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._create_sync,
@@ -30,6 +38,7 @@ class ChatCompletionClient:
             tools=tools or [],
             tool_choice=tool_choice,
             response_format=response_format,
+            enable_thinking=enable_thinking,
         )
 
     def _create_sync(
@@ -39,15 +48,19 @@ class ChatCompletionClient:
         tools: list[dict[str, Any]],
         tool_choice: str,
         response_format: dict[str, Any] | None,
+        enable_thinking: bool | None,
     ) -> dict[str, Any]:
         if not self.config.is_configured():
             raise RuntimeError("Model gateway is not configured. Check .env.")
 
+        think = self.config.enable_thinking if enable_thinking is None else enable_thinking
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
             "temperature": self.config.temperature,
             "stream": self.config.stream,
+            # enable_thinking is read from chat_template_kwargs by the contest gateway.
+            "chat_template_kwargs": {"enable_thinking": think},
         }
         if self.config.max_tokens > 0:
             payload["max_tokens"] = self.config.max_tokens
@@ -62,28 +75,68 @@ class ChatCompletionClient:
             "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",
         }
+        # The task spec is internally inconsistent about the header name
+        # (package_id vs packageId); send both so token accounting always binds.
         if self.config.package_id:
             headers["package_id"] = self.config.package_id
+            headers["packageId"] = self.config.package_id
 
+        attempts = max(1, self.config.max_retries + 1)
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                data = self._attempt_post(body=body, headers=headers)
+                result = self._parse_response(data)
+                self._log_usage(result)
+                return result
+            except _RetryableGatewayError as exc:
+                last_error = exc
+                if attempt < attempts:
+                    delay = self.config.retry_backoff * (2 ** (attempt - 1))
+                    print(
+                        f"model gateway transient error (attempt {attempt}/{attempts}), "
+                        f"retry in {delay:.1f}s: {exc}",
+                        file=sys.stderr,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(f"Model gateway failed after {attempts} attempts: {exc}") from exc
+
+        raise RuntimeError(f"Model gateway failed: {last_error}")
+
+    def _attempt_post(self, *, body: bytes, headers: dict[str, str]) -> str:
         request = urllib.request.Request(
             self.config.chat_completions_url,
             data=body,
             headers=headers,
             method="POST",
         )
-
         try:
             with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
-                data = response.read().decode("utf-8")
-        except http.client.RemoteDisconnected:
-            data = self._post_with_http_client(body=body, headers=headers)
+                return response.read().decode("utf-8")
+        except http.client.RemoteDisconnected as exc:
+            try:
+                return self._post_with_http_client(body=body, headers=headers)
+            except Exception as inner:  # fall back failed too -> retry whole attempt
+                raise _RetryableGatewayError(f"remote disconnected: {inner}") from exc
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code >= 500:
+                raise _RetryableGatewayError(f"HTTP {exc.code}: {detail}") from exc
             raise RuntimeError(f"Model gateway HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Model gateway connection failed: {exc}") from exc
+        except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+            raise _RetryableGatewayError(f"connection failed: {exc}") from exc
 
-        return self._parse_response(data)
+    def _log_usage(self, result: dict[str, Any]) -> None:
+        usage = result.get("usage")
+        if isinstance(usage, dict):
+            prompt = usage.get("prompt_tokens")
+            completion = usage.get("completion_tokens")
+            total = usage.get("total_tokens")
+            print(
+                f"token usage: prompt={prompt} completion={completion} total={total}",
+                file=sys.stderr,
+            )
 
     def _post_with_http_client(self, *, body: bytes, headers: dict[str, str]) -> str:
         parsed = urllib.parse.urlparse(self.config.chat_completions_url)
@@ -127,6 +180,7 @@ class ChatCompletionClient:
         completion_id = "streamed"
         model = self.config.model
         created = None
+        usage: dict[str, Any] | None = None
 
         for line in data.splitlines():
             line = line.strip()
@@ -143,6 +197,8 @@ class ChatCompletionClient:
             completion_id = chunk.get("id") or completion_id
             model = chunk.get("model") or model
             created = chunk.get("created", created)
+            if isinstance(chunk.get("usage"), dict):
+                usage = chunk["usage"]
             choices = chunk.get("choices") or []
             if not choices:
                 continue
@@ -207,7 +263,7 @@ class ChatCompletionClient:
         if tool_calls:
             message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
 
-        return {
+        result: dict[str, Any] = {
             "id": completion_id,
             "created": created,
             "model": model,
@@ -220,6 +276,9 @@ class ChatCompletionClient:
                 }
             ],
         }
+        if usage is not None:
+            result["usage"] = usage
+        return result
 
 
 def first_message(completion: dict[str, Any]) -> dict[str, Any]:

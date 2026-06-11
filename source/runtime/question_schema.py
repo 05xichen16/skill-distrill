@@ -33,7 +33,13 @@ def load_task_records(path: str | Path) -> list[dict[str, Any]]:
 
 
 def public_question_fields(task: dict[str, Any]) -> dict[str, Any]:
-    """Return only fields visible to the contestant Agent."""
+    """Return the fields visible to the contestant Agent.
+
+    Keeps the human-useful context the platform ships with each task: ``title``
+    and ``explanation`` (the latter describes the runtime variants we must
+    generalize over), plus the per-question ``tools``/``skills``/``sub_agents``
+    hints. Idempotent: safe to apply to an already-trimmed dict.
+    """
 
     question = task.get("question", task.get("description"))
     if not isinstance(question, str) or not question.strip():
@@ -43,6 +49,14 @@ def public_question_fields(task: dict[str, Any]) -> dict[str, Any]:
     if "id" in task:
         public["id"] = task["id"]
     public["question"] = question
-    if "files" in task and task["files"]:
+    for optional_key in ("title", "explanation"):
+        value = task.get(optional_key)
+        if isinstance(value, str) and value.strip():
+            public[optional_key] = value
+    if task.get("files"):
         public["files"] = task["files"]
+    for hint_key in ("tools", "skills", "sub_agents"):
+        value = task.get(hint_key)
+        if value:
+            public[hint_key] = value
     return public

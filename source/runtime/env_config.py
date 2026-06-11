@@ -62,6 +62,9 @@ class ModelConfig:
     max_tokens: int
     stream: bool
     package_id: str
+    enable_thinking: bool
+    max_retries: int
+    retry_backoff: float
 
     @classmethod
     def from_env(cls) -> "ModelConfig":
@@ -81,6 +84,9 @@ class ModelConfig:
             max_tokens=env_int("AGENT_DEMO_MAX_TOKENS", 0),
             stream=env_bool("AGENT_DEMO_STREAM", False),
             package_id=(os.getenv("PACKAGE_ID", "").strip() or os.getenv("packageId", "").strip()),
+            enable_thinking=env_bool("AGENT_DEMO_ENABLE_THINKING", True),
+            max_retries=env_int("AGENT_DEMO_MAX_RETRIES", 2),
+            retry_backoff=env_float("AGENT_DEMO_RETRY_BACKOFF", 1.0),
         )
 
     def is_configured(self) -> bool:

@@ -1,12 +1,26 @@
 from __future__ import annotations
 
+import base64
 import json
 import re
+import sys
+from pathlib import Path
 from typing import Any
 
 from source.runtime.env_config import ModelConfig, env_bool, env_int, load_dotenv
 from source.runtime.agent_context import AgentContext
 from source.runtime.openai_chat_client import ChatCompletionClient, first_message
+
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+IMAGE_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+}
 
 
 SYSTEM_PROMPT = """
@@ -31,45 +45,124 @@ class ContestantAgent:
             raise RuntimeError("AGENT_DEMO_USE_LLM is disabled; configure a model gateway or implement ContestantAgent.solve().")
 
         # 参赛者主要改这里：
-        # - question 是赛方运行器传入的公开题面对象，只包含 id/question/files 等可见字段。
-        # - question["files"] 是本题允许读取的文件或目录列表，文件内容不会自动进入上下文。
+        # - question 是赛方运行器传入的公开题面对象，包含 id/question/title/explanation/files 等可见字段。
+        # - question["files"] 是本题允许读取的文件或目录列表，文本内容不会自动进入上下文（需 text_read_file）。
+        # - 图片附件会在这里自动 base64 注入为 image_url 块，让多模态模型直接看到。
         # - context 提供当前 solution 自动发现到的 MCP tools、skills、sub-agents 以及 call_tool(...) 调用入口。
-        # - available_tools / available_skills / available_sub_agents 会一起传给模型，供主 Agent 自己决定是否调用。
-        user_prompt = json.dumps(
+        text_prompt = json.dumps(
             {
                 "question": question,
                 "files": question.get("files") or [],
                 "available_tools": context.available_tools,
                 "available_skills": context.available_skills,
                 "available_sub_agents": context.available_agents,
-                "tool_usage": "Call tools only when useful. Use text_read_file to read declared files; use skill_load before skill_run; use agent_delegate for sub-agents.",
+                "tool_usage": "Call tools only when useful. Declared images are already attached; use text_read_file to read declared text files; use skill_load before skill_run; use agent_delegate for sub-agents.",
                 "final_output": "Return only the final answer text.",
             },
             ensure_ascii=False,
             indent=2,
         )
-
-        return await self._run_model_loop(
-            system_prompt=SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            context=context,
-        )
-
-    async def _run_model_loop(self, *, system_prompt: str, user_prompt: str, context: AgentContext) -> str:
-        if not env_bool("AGENT_DEMO_NATIVE_TOOLS", True):
-            return await self._run_json_tool_loop(system_prompt=system_prompt, user_prompt=user_prompt, context=context)
+        user_content = self._compose_content(text_prompt, self._image_blocks(context))
+        enable_thinking = self._should_enable_thinking(question)
 
         try:
-            return await self._run_native_tool_loop(system_prompt=system_prompt, user_prompt=user_prompt, context=context)
+            return await self._run_model_loop(
+                system_prompt=SYSTEM_PROMPT,
+                user_content=user_content,
+                context=context,
+                enable_thinking=enable_thinking,
+            )
+        except Exception as exc:  # last-resort safety net: never return an empty answer
+            print(f"agent loop failed, falling back to direct answer: {exc}", file=sys.stderr)
+            return await self._direct_answer(user_content, enable_thinking=enable_thinking)
+
+    def _should_enable_thinking(self, question: dict[str, Any]) -> bool:
+        """Routing hook for the thinking/token trade-off.
+
+        Phase A keeps thinking on for correctness (token is only a tiebreaker).
+        Phase B can branch here per question type/level to win the token
+        tiebreak without risking correctness.
+        """
+
+        return env_bool("AGENT_DEMO_ENABLE_THINKING", True)
+
+    def _iter_image_files(self, context: AgentContext):
+        for raw in context.allowed_file_paths:
+            path = Path(raw)
+            if path.is_dir():
+                for child in sorted(path.rglob("*")):
+                    if child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS:
+                        yield child
+            elif path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+                yield path
+
+    def _image_blocks(self, context: AgentContext) -> list[dict[str, Any]]:
+        blocks: list[dict[str, Any]] = []
+        for path in self._iter_image_files(context):
+            try:
+                raw = path.read_bytes()
+            except OSError as exc:
+                print(f"failed to read image {path}: {exc}", file=sys.stderr)
+                continue
+            mime = IMAGE_MIME_TYPES.get(path.suffix.lower(), "image/png")
+            encoded = base64.b64encode(raw).decode("ascii")
+            blocks.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{encoded}"},
+                }
+            )
+        return blocks
+
+    def _compose_content(self, text: str, images: list[dict[str, Any]]):
+        if images:
+            return [{"type": "text", "text": text}, *images]
+        return text
+
+    def _split_user_content(self, user_content) -> tuple[str, list[dict[str, Any]]]:
+        if isinstance(user_content, str):
+            return user_content, []
+        text_parts: list[str] = []
+        images: list[dict[str, Any]] = []
+        for block in user_content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text_parts.append(str(block.get("text") or ""))
+            elif block.get("type") == "image_url":
+                images.append(block)
+        return "\n".join(text_parts), images
+
+    async def _direct_answer(self, user_content, *, enable_thinking: bool) -> str:
+        config = ModelConfig.from_env()
+        client = ChatCompletionClient(config)
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+        completion = await client.create(
+            messages=messages,
+            tools=[],
+            tool_choice="none",
+            enable_thinking=enable_thinking,
+        )
+        return self._clean_final_answer(str(first_message(completion).get("content") or ""))
+
+    async def _run_model_loop(self, *, system_prompt: str, user_content, context: AgentContext, enable_thinking: bool) -> str:
+        if not env_bool("AGENT_DEMO_NATIVE_TOOLS", True):
+            return await self._run_json_tool_loop(system_prompt=system_prompt, user_content=user_content, context=context, enable_thinking=enable_thinking)
+
+        try:
+            return await self._run_native_tool_loop(system_prompt=system_prompt, user_content=user_content, context=context, enable_thinking=enable_thinking)
         except Exception:
             if env_bool("AGENT_DEMO_JSON_TOOL_FALLBACK", True):
                 try:
-                    return await self._run_json_tool_loop(system_prompt=system_prompt, user_prompt=user_prompt, context=context)
+                    return await self._run_json_tool_loop(system_prompt=system_prompt, user_content=user_content, context=context, enable_thinking=enable_thinking)
                 except Exception:
                     pass
             raise
 
-    async def _run_native_tool_loop(self, *, system_prompt: str, user_prompt: str, context: AgentContext) -> str:
+    async def _run_native_tool_loop(self, *, system_prompt: str, user_content, context: AgentContext, enable_thinking: bool) -> str:
         config = ModelConfig.from_env()
         client = ChatCompletionClient(config)
         tools = await context.mcp.list_openai_tools(
@@ -78,12 +171,12 @@ class ContestantAgent:
         )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": user_content},
         ]
 
         max_iter = env_int("AGENT_DEMO_MAX_ITER", 6)
         for step in range(1, max_iter + 1):
-            completion = await client.create(messages=messages, tools=tools, tool_choice="auto")
+            completion = await client.create(messages=messages, tools=tools, tool_choice="auto", enable_thinking=enable_thinking)
             message = first_message(completion)
             tool_calls = self._tool_calls_from_message(message)
             content = str(message.get("content") or "")
@@ -113,10 +206,10 @@ class ContestantAgent:
                 )
 
         messages.append({"role": "user", "content": "请停止调用工具，直接输出最终答案文本。"})
-        completion = await client.create(messages=messages, tools=[], tool_choice="none")
+        completion = await client.create(messages=messages, tools=[], tool_choice="none", enable_thinking=enable_thinking)
         return self._clean_final_answer(str(first_message(completion).get("content") or ""))
 
-    async def _run_json_tool_loop(self, *, system_prompt: str, user_prompt: str, context: AgentContext) -> str:
+    async def _run_json_tool_loop(self, *, system_prompt: str, user_content, context: AgentContext, enable_thinking: bool) -> str:
         """Prompt-level JSON tool loop for gateways that reject native tools."""
 
         config = ModelConfig.from_env()
@@ -141,25 +234,24 @@ class ContestantAgent:
             + "\n任务完成时，直接输出最终答案文本；不要包成结果对象。"
         )
 
+        prompt_text, images = self._split_user_content(user_content)
+        first_user_text = json.dumps(
+            {
+                "prompt": prompt_text,
+                "available_tools": tool_specs,
+                "instruction": "如果需要工具，只输出 tool_calls JSON；如果不需要工具，直接输出最终答案文本。",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": json_tool_prompt},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "prompt": user_prompt,
-                        "available_tools": tool_specs,
-                        "instruction": "如果需要工具，只输出 tool_calls JSON；如果不需要工具，直接输出最终答案文本。",
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            },
+            {"role": "user", "content": self._compose_content(first_user_text, images)},
         ]
 
         max_iter = env_int("AGENT_DEMO_MAX_ITER", 6)
         for step in range(1, max_iter + 1):
-            completion = await client.create(messages=messages, tools=[], tool_choice="none")
+            completion = await client.create(messages=messages, tools=[], tool_choice="none", enable_thinking=enable_thinking)
             content = str(first_message(completion).get("content") or "").strip()
 
             parsed = self._parse_json_object(content)
@@ -208,7 +300,7 @@ class ContestantAgent:
             )
 
         messages.append({"role": "user", "content": "请停止请求工具，直接输出最终答案文本。"})
-        completion = await client.create(messages=messages, tools=[], tool_choice="none")
+        completion = await client.create(messages=messages, tools=[], tool_choice="none", enable_thinking=enable_thinking)
         return self._clean_final_answer(str(first_message(completion).get("content") or ""))
 
     async def _call_tool_as_text(self, context: AgentContext, tool_name: str, tool_args: dict[str, Any]) -> str:
@@ -297,7 +389,33 @@ class ContestantAgent:
 
     def _clean_final_answer(self, content: str) -> str:
         cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        # Drop a dangling unclosed reasoning block if the model only emitted <think>.
+        cleaned = re.sub(r"<think>.*\Z", "", cleaned, flags=re.DOTALL).strip()
+        cleaned = self._strip_markdown_fence(cleaned)
+        cleaned = self._strip_answer_prefix(cleaned)
+        cleaned = self._strip_wrapping_quotes(cleaned)
         return cleaned or content.strip()
+
+    def _strip_markdown_fence(self, text: str) -> str:
+        match = re.fullmatch(r"```[a-zA-Z0-9_]*\n(.*?)\n?```", text, flags=re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return text
+
+    def _strip_answer_prefix(self, text: str) -> str:
+        # Remove a single leading label like "答案：" / "最终答案:" / "Answer:" if present.
+        pattern = r"^\s*(?:最终答案|最终结果|答案|结果|回答|Answer|Final Answer|Result)\s*[:：]\s*"
+        stripped = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE)
+        return stripped.strip()
+
+    def _strip_wrapping_quotes(self, text: str) -> str:
+        pairs = {'"': '"', "'": "'", "“": "”", "‘": "’", "「": "」", "『": "』"}
+        if len(text) >= 2 and text[0] in pairs and text[-1] == pairs[text[0]]:
+            inner = text[1:-1].strip()
+            # Only unwrap when the quotes are truly enclosing (no same quote inside).
+            if text[0] not in inner and pairs[text[0]] not in inner:
+                return inner
+        return text
 
     def _json_prompt_tool_calls(self, parsed: dict[str, Any]) -> list[dict[str, Any]] | None:
         tool_calls = parsed.get("tool_calls")

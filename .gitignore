@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Contest run outputs (keep the .gitkeep placeholder)
+source/outputs/*.json
+
+# Local contest materials — questions/attachments/sensitive data, NOT for the remote
+publish/
+real_questions*.json

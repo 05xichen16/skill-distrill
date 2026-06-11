@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 import sys
 from typing import Any
 
 from source.runtime.agent_context import AgentContext
 from source.runtime.agent_registry import AgentRegistry
+from source.runtime.env_config import env_int, load_dotenv
 from source.runtime.mcp_client import LocalMCPClient
 from source.runtime.question_loader import load_questions
 from source.runtime.question_schema import public_question_fields
@@ -22,15 +24,53 @@ class BatchRunner:
         output_path = Path(output_path).resolve()
         questions = load_questions(question_path)
         question_dir = question_path.parent
-        results: list[dict[str, Any]] = []
 
+        load_dotenv()
+        concurrency = max(1, env_int("AGENT_DEMO_CONCURRENCY", 1))
+        if concurrency == 1 or len(questions) <= 1:
+            return await self._run_serial(questions, question_dir=question_dir, output_path=output_path)
+        return await self._run_concurrent(
+            questions, question_dir=question_dir, output_path=output_path, concurrency=concurrency
+        )
+
+    async def _run_serial(
+        self, questions: list[dict[str, Any]], *, question_dir: Path, output_path: Path
+    ) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
         for index, question in enumerate(questions, start=1):
             qid = str(question.get("id", index))
             print(f"[{index}/{len(questions)}] running question {qid}")
             result = await self._run_one(question=public_question(question), question_dir=question_dir)
             results.append(result)
             write_results(output_path, results)
+        return results
 
+    async def _run_concurrent(
+        self,
+        questions: list[dict[str, Any]],
+        *,
+        question_dir: Path,
+        output_path: Path,
+        concurrency: int,
+    ) -> list[dict[str, Any]]:
+        total = len(questions)
+        slots: list[dict[str, Any] | None] = [None] * total
+        semaphore = asyncio.Semaphore(concurrency)
+        write_lock = asyncio.Lock()
+
+        async def worker(index: int, question: dict[str, Any]) -> None:
+            qid = str(question.get("id", index + 1))
+            async with semaphore:
+                print(f"[{index + 1}/{total}] running question {qid}")
+                result = await self._run_one(question=public_question(question), question_dir=question_dir)
+            slots[index] = result
+            # Flush after each completion so a 1-hour cutoff keeps finished answers.
+            async with write_lock:
+                write_results(output_path, [item for item in slots if item is not None])
+
+        await asyncio.gather(*(worker(index, question) for index, question in enumerate(questions)))
+        results = [item for item in slots if item is not None]
+        write_results(output_path, results)
         return results
 
     async def _run_one(self, *, question: dict[str, Any], question_dir: Path) -> dict[str, Any]:
