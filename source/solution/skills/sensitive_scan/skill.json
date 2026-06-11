@@ -1,0 +1,21 @@
+{
+  "name": "sensitive_scan",
+  "description": "Scan a (possibly nested) archive for sensitive data: phone numbers, emails, ID-card numbers and API keys. Counts total occurrences (no dedup) across text files via deterministic regex, and across images via model OCR transcription + the same regex.",
+  "entrypoint": "scripts/run.py",
+  "timeout_seconds": 300,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "zip_path": {
+        "type": "string",
+        "description": "Path to the archive declared in the question (e.g. 'sensitive_data_2_1.zip'). Relative paths resolve against the question directory."
+      },
+      "do_ocr": {
+        "type": "boolean",
+        "description": "Whether to OCR images via the model gateway and add their counts. Defaults to true; set false for a pure-offline deterministic text-only scan."
+      }
+    },
+    "required": ["zip_path"],
+    "additionalProperties": true
+  }
+}

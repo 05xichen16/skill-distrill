@@ -99,7 +99,38 @@ class LocalMCPClient:
         if name == "text_read_file":
             args["path"] = str(self._resolve_allowed_file(args, runtime_context))
 
+        if name == "skill_run":
+            self._inject_skill_runtime(args, runtime_context)
+
         return await self._tools[name].call(args)
+
+    @staticmethod
+    def _inject_skill_runtime(
+        args: dict[str, Any],
+        runtime_context: dict[str, Any],
+    ) -> None:
+        """Pass question context into a skill subprocess via ``arguments._runtime``.
+
+        Mirrors the ``text_read_file`` resolution model: skills (e.g. the
+        sensitive-data scanner) need ``question_dir`` to resolve relative file
+        paths declared in the question. ``skill_run`` previously dropped the
+        runtime context, so this re-attaches it under a reserved key without
+        touching the caller-supplied arguments.
+        """
+        arguments = args.get("arguments")
+        if not isinstance(arguments, dict):
+            arguments = {}
+            args["arguments"] = arguments
+
+        question_dir = runtime_context.get("question_dir")
+        runtime_payload: dict[str, Any] = {
+            "question_dir": str(question_dir) if question_dir is not None else "",
+            "allowed_file_paths": [
+                str(path) for path in runtime_context.get("allowed_file_paths", [])
+            ],
+            "question_id": runtime_context.get("question_id", ""),
+        }
+        arguments["_runtime"] = runtime_payload
 
     def _resolve_allowed_file(
         self,
