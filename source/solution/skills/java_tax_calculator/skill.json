@@ -1,8 +1,8 @@
 {
   "name": "java_tax_calculator",
-  "description": "Decode the Java tax calculator source parameters and compute the hidden salary outputs with a java-version prefix.",
+  "description": "Repair the buggy Java tax source with the model, compile and validate against the worked examples, then compute the hidden salary outputs with a java-version prefix (python fallback when no JDK).",
   "entrypoint": "scripts/run.py",
-  "timeout_seconds": 30,
+  "timeout_seconds": 240,
   "input_schema": {
     "type": "object",
     "properties": {
@@ -15,7 +15,9 @@
         "description": "Path to the declared Java source file. Relative paths resolve against the question directory."
       }
     },
-    "required": ["task_description"],
+    "required": [
+      "task_description"
+    ],
     "additionalProperties": true
   }
 }

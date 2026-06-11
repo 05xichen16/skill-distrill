@@ -944,6 +944,17 @@ def answer(
     if _env_bool("WIKI_DIALOG_SUBMIT_PROPOSALS", False):
         _maybe_submit_proposals(contract, db_candidates, timeout, warnings)
 
+    # Degradation self-check: a placeholder-ridden array scores 0 under
+    # list_equal anyway, while the generic model loop historically earns
+    # partial credit on this task. Failing loudly makes the router fall back
+    # instead of submitting a structurally dead answer.
+    placeholders = sum(1 for entry in per_dialog if entry["source"] == "none")
+    if not resolvable or placeholders * 3 > n:
+        raise RuntimeError(
+            "degraded output: %d/%d placeholder replies (db=%d, wiki=%d, keys mapped=%d): %s"
+            % (placeholders, n, len(db_candidates), len(wiki_candidates), len(key_map), "; ".join(warnings[-3:]))
+        )
+
     final_answer = json.dumps(elements, ensure_ascii=False)
     return {
         "answer": final_answer,
@@ -1029,7 +1040,7 @@ def main() -> None:
 
     try:
         result = answer(args)
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
         _emit({"error": str(exc)})
         raise SystemExit(1)
 

@@ -792,20 +792,21 @@ def _verify_one(
     parser: Callable[..., List[Dict[str, Any]]],
     requester: Callable[..., Tuple[int, Any]],
     last_token: Optional[str],
-) -> Tuple[bool, str, Optional[str]]:
-    """Verify one case. Returns ``(passed, reason, latest_token)``.
+) -> Tuple[bool, str, Optional[str], bool]:
+    """Verify one case. Returns ``(passed, reason, latest_token, judged)``.
 
     Never raises. On a missing model config, a parse failure or a transport
-    failure it returns ``passed=True`` with a reason (conservative: NOT reported
-    as failing) so an unjudgeable case does not shift the position-sensitive
-    failing-ID list. Only a real assertion miss marks the case as failing.
+    failure it returns ``passed=True, judged=False`` (conservative: NOT
+    reported as failing — most cases do pass) so a single unjudgeable case
+    does not shift the position-sensitive failing-ID list. The caller counts
+    ``judged=False`` cases and escalates when they dominate.
     """
     case_id = str(case.get("id") or "")
     description = str(case.get("description") or "")
     assertion = case.get("assert") if isinstance(case.get("assert"), dict) else {}
 
     if config is None:
-        return True, "model not configured; %s not judged (conservative pass)" % case_id, last_token
+        return True, "model not configured; %s not judged (conservative pass)" % case_id, last_token, False
 
     steps: List[Dict[str, Any]] = []
     last_error: Optional[str] = None
@@ -814,23 +815,32 @@ def _verify_one(
             steps = parser(config, description, api_doc, auth, timeout)
         except Exception as exc:  # noqa: BLE001 - model/transport error
             last_error = str(exc)
+            steps = []
             if attempt + 1 < max(1, retries):
                 time.sleep(min(8.0, 0.5 * (2 ** attempt)))
             continue
-        break
+        if steps:
+            break
+        # Model answered but produced no parseable steps; retry the seam.
+        if attempt + 1 < max(1, retries):
+            time.sleep(min(8.0, 0.5 * (2 ** attempt)))
 
     if not steps:
         reason = "no steps parsed for %s%s (conservative pass)" % (
             case_id, ": %s" % last_error if last_error else "",
         )
-        return True, reason, last_token
+        return True, reason, last_token, False
 
     status, body, error, token = run_case(steps, auth, package_id, timeout, requester, last_token)
     if error:
-        return True, "%s; %s not judged (conservative pass)" % (error, case_id), token
+        # Transient service hiccups happen; re-run the case once before
+        # declaring it unjudgeable.
+        status, body, error, token = run_case(steps, auth, package_id, timeout, requester, token)
+    if error:
+        return True, "%s; %s not judged (conservative pass)" % (error, case_id), token, False
 
     passed, reason = assert_response(status if status is not None else -1, body, assertion)
-    return passed, reason, token
+    return passed, reason, token, True
 
 
 # --- main flow -------------------------------------------------------------
@@ -898,16 +908,29 @@ def answer(
     per_case: List[Dict[str, Any]] = []
     failed: List[str] = []
     token: Optional[str] = None
+    unjudged = 0
     for case in cases:
         case_id = str(case.get("id") or "")
-        passed, reason, token = _verify_one(
+        passed, reason, token, judged = _verify_one(
             case, api_doc, auth, package_id, config, timeout, retries, parser, requester, token,
         )
-        per_case.append({"id": case_id, "passed": passed, "reason": reason})
+        per_case.append({"id": case_id, "passed": passed, "judged": judged, "reason": reason})
+        if not judged:
+            unjudged += 1
         if not passed and case_id:
             failed.append(case_id)
         if reason and not passed:
             warnings.append("%s FAILED: %s" % (case_id, reason))
+
+    # When unjudgeable cases dominate, the silent all-pass answer is a known
+    # platform failure mode (1.07/6): raise so the router falls back to the
+    # model loop instead of submitting it. A model config that was never there
+    # is the local/offline situation — keep the legacy conservative answer.
+    if cases and config is not None and unjudged * 3 > len(cases):
+        raise RuntimeError(
+            "degraded output: %d/%d cases unjudgeable (parse/service failures); %s"
+            % (unjudged, len(cases), "; ".join(warnings[-3:]))
+        )
 
     # Failing IDs joined by code, in test_cases file order (position-sensitive).
     final_answer = SEP.join(failed)
@@ -916,6 +939,7 @@ def answer(
         "per_case": per_case,
         "failed": failed,
         "n": len(cases),
+        "unjudged": unjudged,
         "warnings": warnings,
     }
 

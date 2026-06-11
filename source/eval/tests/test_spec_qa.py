@@ -539,3 +539,66 @@ class DocxDegradationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- EN->CN retrieval bridge -------------------------------------------------
+
+class EnglishBridgeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = MOD
+
+    def test_mostly_english_detection(self) -> None:
+        self.assertTrue(self.module._is_mostly_english(
+            "In Python, which operator should be used when comparing with None?"
+        ))
+        self.assertFalse(self.module._is_mostly_english(
+            "Python中导入模块应该按照什么顺序排列？"
+        ))
+
+    def test_bridge_parses_keywords_and_survives_failure(self) -> None:
+        def good_answerer(config, prompt, timeout):
+            return "空值比较, is 运算符, 与None比较"
+
+        keywords = self.module._chinese_keywords_via_model(
+            {"url": "u"}, "Which operator compares with None?", 5, good_answerer
+        )
+        self.assertEqual(keywords, ["空值比较", "is 运算符", "与None比较"])
+
+        def bad_answerer(config, prompt, timeout):
+            raise RuntimeError("gateway down")
+
+        self.assertEqual(
+            self.module._chinese_keywords_via_model(
+                {"url": "u"}, "Which operator?", 5, bad_answerer
+            ),
+            [],
+        )
+
+    def test_english_question_bridges_before_retrieval(self) -> None:
+        # The bridge keywords must reach retrieve() so the Chinese spec lines
+        # become findable for an English question.
+        calls = []
+
+        def answerer(config, prompt, timeout):
+            calls.append(prompt)
+            if "Chinese keywords" in prompt:
+                return "魔法关键词"
+            return "答案"
+
+        spec = "\n".join(["规范第%d条。" % i for i in range(50)] + ["魔法关键词：与None比较时使用is。"])
+        item = {"q": "Q1", "group": "Python", "text": "Which operator should be used when comparing with None?"}
+        answer, source, warning = self.module._answer_one(
+            item,
+            {"Python": spec},
+            ["Python"],
+            {"url": "u", "api_key": "k", "model": "m", "package_id": ""},
+            5,
+            1,
+            400,  # tight budget: head-of-spec fallback would MISS the last line
+            2,
+            answerer,
+        )
+        self.assertEqual(answer, "答案")
+        # the second call's prompt (the QA call) must contain the bridged line
+        qa_prompt = calls[-1]
+        self.assertIn("魔法关键词：与None比较时使用is。", qa_prompt)

@@ -179,7 +179,14 @@ class ContestantAgentRouterTest(unittest.IsolatedAsyncioTestCase):
             },
             context=_StubContext(),
         )
-        self.assertEqual(route, ("purchase_clean_summary", {"source_dir": "./采购数据清洗与汇总"}))
+        # task_description carries the cleaning rules for the LLM rescue pass.
+        self.assertEqual(
+            route,
+            (
+                "purchase_clean_summary",
+                {"task_description": "clean purchase data", "source_dir": "./采购数据清洗与汇总"},
+            ),
+        )
 
     def test_po_audit_route_uses_source_dir(self) -> None:
         route = self.agent._explicit_skill_route(
@@ -190,7 +197,15 @@ class ContestantAgentRouterTest(unittest.IsolatedAsyncioTestCase):
             },
             context=_StubContext(),
         )
-        self.assertEqual(route, ("po_compliance_audit", {"source_dir": "./采购PO合规审计"}))
+        # task_description rides along so the skill can parse the variant's
+        # amount threshold out of the question text.
+        self.assertEqual(
+            route,
+            (
+                "po_compliance_audit",
+                {"task_description": "audit POs", "source_dir": "./采购PO合规审计"},
+            ),
+        )
 
     async def test_solve_returns_skill_answer_even_when_main_llm_disabled(self) -> None:
         os.environ["AGENT_DEMO_USE_LLM"] = "false"

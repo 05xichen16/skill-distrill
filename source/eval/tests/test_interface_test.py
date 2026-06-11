@@ -488,10 +488,11 @@ class EndToEndTest(unittest.TestCase):
         self.assertTrue(any("not configured" in w for w in result["warnings"]))
 
     def test_parse_failure_is_conservative_pass(self) -> None:
-        # The model seam raising for one case must NOT mark it failing (it would
-        # be a false positive that shifts every later position).
+        # The model seam raising for a MINORITY of cases must NOT mark them
+        # failing (a false positive would shift every later position). With
+        # 1/3 unjudgeable the answer stays conservative.
         with tempfile.TemporaryDirectory() as tmp:
-            doc_dir = _write_inputs(Path(tmp), [CASES[0], CASES[1]])  # C1, C2(fail)
+            doc_dir = _write_inputs(Path(tmp), [CASES[0], CASES[1], CASES[2]])  # C1, C2(fail), C3
             _set_fake_config()
             os.environ["INTERFACE_TEST_RETRIES"] = "1"
             svc = FakeService()
@@ -508,8 +509,12 @@ class EndToEndTest(unittest.TestCase):
                 os.environ.pop("INTERFACE_TEST_RETRIES", None)
         # C1 degraded to a conservative pass; only the genuinely-failing C2 shows.
         self.assertEqual(result["answer"], "C2")
+        self.assertEqual(result["unjudged"], 1)
 
-    def test_transport_error_is_conservative_pass(self) -> None:
+    def test_unjudgeable_majority_raises_for_router_fallback(self) -> None:
+        # Platform failure mode (1.07/6): every case silently passed because the
+        # service/parse layer was broken. Dominant unjudgeable cases must raise
+        # so the router falls back to the model loop instead of submitting "".
         with tempfile.TemporaryDirectory() as tmp:
             doc_dir = _write_inputs(Path(tmp), [CASES[0]])  # C1
             _set_fake_config()
@@ -522,9 +527,9 @@ class EndToEndTest(unittest.TestCase):
                 "doc_dir": str(doc_dir),
                 "_runtime": {"question_dir": str(doc_dir.parent)},
             }
-            result = MOD.answer(args, parser=_fake_parser(STEPS_BY_ID), requester=boom)
-        self.assertEqual(result["answer"], "")  # unreachable service -> no report
-        self.assertEqual(result["failed"], [])
+            with self.assertRaises(RuntimeError) as ctx:
+                MOD.answer(args, parser=_fake_parser(STEPS_BY_ID), requester=boom)
+        self.assertIn("degraded output", str(ctx.exception))
 
     def test_package_id_header_on_every_call(self) -> None:
         # The same X-Package-Id must ride every request for the whole run.

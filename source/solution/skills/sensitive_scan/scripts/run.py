@@ -42,6 +42,7 @@ import re
 import sys
 import tarfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -349,13 +350,36 @@ def scan(args: Dict[str, Any]) -> Dict[str, Any]:
             )
         else:
             timeout = _ocr_timeout()
-            for name, data in collector.images:
-                try:
-                    transcription = ocr_image(config, name, data, timeout)
-                    _add(image_counts, count_text(transcription))
+            retries = _env_int("SENSITIVE_SCAN_RETRIES", 2, minimum=1)
+            workers = _env_int("SENSITIVE_SCAN_WORKERS", 4, minimum=1)
+
+            # Bounded concurrency: the production gateway takes ~50-60s per
+            # image, so 6 sequential images blow past the 300s skill timeout.
+            # Concurrent OCR keeps wall-clock near a single image's latency.
+            # One failed image degrades to a warning, never kills the scan.
+            def ocr_one(item: Tuple[str, bytes]) -> Tuple[Dict[str, int], Optional[str]]:
+                name, data = item
+                last_exc: Optional[Exception] = None
+                for _ in range(retries):
+                    try:
+                        transcription = ocr_image(config, name, data, timeout)
+                        return count_text(transcription), None
+                    except Exception as exc:  # noqa: BLE001 - graceful degradation
+                        last_exc = exc
+                return _empty_counts(), "OCR failed for %s: %s" % (name, last_exc)
+
+            if workers <= 1 or images_total == 1:
+                outcomes = [ocr_one(item) for item in collector.images]
+            else:
+                with ThreadPoolExecutor(max_workers=min(workers, images_total)) as pool:
+                    outcomes = list(pool.map(ocr_one, collector.images))
+
+            for counts, warning in outcomes:
+                if warning:
+                    warnings.append(warning)
+                else:
+                    _add(image_counts, counts)
                     images_ocr_ok += 1
-                except Exception as exc:  # noqa: BLE001 - graceful degradation
-                    warnings.append("OCR failed for %s: %s" % (name, exc))
     elif do_ocr and not images_total:
         # nothing to OCR
         pass
@@ -386,6 +410,16 @@ def _ocr_timeout() -> int:
         return max(5, int(raw))
     except ValueError:
         return 60
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
 
 
 def main() -> None:

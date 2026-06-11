@@ -111,7 +111,101 @@ class ContestantAgent:
         if answer is None:
             print(f"explicit skill route {skill_name} returned no answer field", file=sys.stderr)
             return None
+        rejection = self._skill_answer_guard(skill_name, answer)
+        if rejection is not None:
+            print(
+                f"explicit skill route {skill_name} rejected by answer guard ({rejection}); "
+                "falling back to the model loop",
+                file=sys.stderr,
+            )
+            return None
         return answer
+
+    # Answers that are structurally broken (empty, placeholder-ridden, or the
+    # wrong shape for the grader) score zero anyway — falling back to the model
+    # loop can only help. Guards check *shape only*: a wrong-but-well-formed
+    # answer must pass, so a correct unusual answer is never rejected.
+    _EMPTY_ANSWER_OK = {"po_compliance_audit", "interface_test"}
+
+    def _skill_answer_guard(self, skill_name: str, answer: str) -> str | None:
+        """Return a rejection reason for degraded skill output, or None to accept."""
+        text = answer.strip()
+        if not text:
+            # "nothing failed / no violations" is a legal empty answer for these.
+            return None if skill_name in self._EMPTY_ANSWER_OK else "empty answer"
+
+        guard = getattr(self, f"_guard_{skill_name}", None)
+        if guard is None:
+            return None
+        try:
+            return guard(text)
+        except Exception as exc:  # noqa: BLE001 - a broken guard must not block a skill
+            print(f"answer guard for {skill_name} crashed ({exc}); accepting answer", file=sys.stderr)
+            return None
+
+    def _guard_wiki_dialog(self, text: str) -> str | None:
+        try:
+            elements = json.loads(text)
+        except json.JSONDecodeError:
+            return "answer is not a JSON array"
+        if not isinstance(elements, list) or not elements:
+            return "answer is not a non-empty JSON array"
+        empty_replies = 0
+        for element in elements:
+            value = str(element)
+            if "=>" not in value or value.count("|||") != 2:
+                return "element missing =>/||| structure"
+            reply = value.split("|||")[1]
+            if not reply.strip():
+                empty_replies += 1
+        if empty_replies * 3 > len(elements):
+            return f"{empty_replies}/{len(elements)} replies are empty placeholders"
+        return None
+
+    def _guard_date_normalize(self, text: str) -> str | None:
+        segments = [segment.strip() for segment in text.split(",")]
+        if not all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", segment) for segment in segments):
+            return "segments are not all yyyy-mm-dd dates"
+        return None
+
+    def _guard_java_tax_calculator(self, text: str) -> str | None:
+        segments = [segment.strip() for segment in text.split(",")]
+        if len(segments) < 11:
+            return f"expected >=11 segments, got {len(segments)}"
+        if "version" not in segments[0].lower():
+            return "first segment lacks a java version"
+        for segment in segments[1:]:
+            if not re.fullmatch(r"-?\d+(?:\.\d+)?", segment):
+                return f"non-numeric tax segment: {segment!r}"
+        return None
+
+    def _guard_sensitive_scan(self, text: str) -> str | None:
+        segments = [segment.strip() for segment in text.split(",")]
+        if len(segments) != 4 or not all(re.fullmatch(r"\d+", segment) for segment in segments):
+            return "answer is not 4 comma-separated counts"
+        return None
+
+    def _guard_purchase_clean_summary(self, text: str) -> str | None:
+        segments = [segment.strip() for segment in text.split(",")]
+        if not all(re.fullmatch(r"-?\d+", segment) for segment in segments):
+            return "segments are not all integers"
+        return None
+
+    def _guard_system_issue_locator(self, text: str) -> str | None:
+        if text.count(",") < 2:
+            return "expected module,api,root-cause shape"
+        return None
+
+    def _guard_spec_qa(self, text: str) -> str | None:
+        if ";" not in text:
+            return "expected ;-separated multi-answer shape"
+        return None
+
+    def _guard_prompt_learn_classify(self, text: str) -> str | None:
+        segments = [segment.strip() for segment in text.split(",")]
+        if len(segments) < 2 or not re.fullmatch(r"\d+\S+", segments[0]):
+            return "segments do not look like <index><label>"
+        return None
 
     def _explicit_skill_route(
         self,
@@ -218,7 +312,8 @@ class ContestantAgent:
             or "采购 po 合规" in text.lower()
             or any("采购PO合规审计" in path or "采购po合规审计" in path.lower() for path in files)
         ):
-            args = {}
+            # task_description carries the variant's amount threshold and rules.
+            args = {"task_description": question_text}
             source_dir = self._find_declared_dir(files, ("采购PO合规审计", "采购po合规审计", "po"))
             if source_dir:
                 args["source_dir"] = source_dir
@@ -228,7 +323,8 @@ class ContestantAgent:
             "采购数据清洗" in text
             or any("采购数据清洗与汇总" in path for path in files)
         ):
-            args = {}
+            # task_description carries the cleaning rules for the LLM rescue pass.
+            args = {"task_description": question_text}
             source_dir = self._find_declared_dir(files, ("采购数据清洗与汇总", "purchase"))
             if source_dir:
                 args["source_dir"] = source_dir

@@ -535,3 +535,53 @@ class EndToEndTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- degradation self-check --------------------------------------------------
+
+class DegradationSelfCheckTest(unittest.TestCase):
+    """An empty candidate pool must raise (router falls back to the model loop)
+    instead of submitting 30 placeholder elements that score 0 under list_equal.
+    """
+
+    def setUp(self) -> None:
+        _force_offline_env()
+
+    def test_empty_candidate_pool_raises(self) -> None:
+        def boom(url: str, timeout: int) -> Any:
+            raise RuntimeError("wiki down")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir = _write_inputs(Path(tmp))
+            (source_dir / "chat_history.db").unlink()  # no DB candidates
+            args = {
+                "task_description": "answer the dialogs",
+                "source_dir": str(source_dir),
+                "_runtime": {"question_dir": str(source_dir.parent), "question_id": "3_3"},
+            }
+            _set_fake_config()
+            try:
+                with self.assertRaises(RuntimeError) as ctx:
+                    MOD.answer(args, selector=_selector_by_reply({}), fetcher=boom)
+                self.assertIn("degraded output", str(ctx.exception))
+            finally:
+                _force_offline_env()
+
+    def test_healthy_pool_still_returns_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir = _write_inputs(Path(tmp))
+            args = {
+                "task_description": "answer the dialogs",
+                "source_dir": str(source_dir),
+                "_runtime": {"question_dir": str(source_dir.parent), "question_id": "3_3"},
+            }
+            _set_fake_config()
+            try:
+                result = MOD.answer(
+                    args, selector=_selector_by_reply({}), fetcher=_fake_wiki_fetcher()
+                )
+            finally:
+                _force_offline_env()
+            elements = json.loads(result["answer"])
+            self.assertTrue(elements)
+            self.assertTrue(all("|||" in element for element in elements))

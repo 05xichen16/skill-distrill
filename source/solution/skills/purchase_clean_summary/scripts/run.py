@@ -380,12 +380,165 @@ def clean_po(
     return vendor, category, amount
 
 
+# --- model gateway + rescue pass ---------------------------------------------
+#
+# The regex extractors above only recognise the public set's wording (invoice
+# labels, void markers, seller prefixes). A hidden variant that rephrases an
+# attachment makes clean_po() drop a PO that *should* count. The rescue pass
+# re-examines only the DROPPED POs with the model under strict acceptance
+# rules; code-accepted POs are never overridden, so the deterministic baseline
+# cannot regress.
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"false", "0", "no", ""}
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
+
+
+def _model_config() -> Optional[Dict[str, str]]:
+    chat_url = (os.getenv("MODEL_CHAT_COMPLETIONS_URL") or "").strip()
+    base_url = (os.getenv("MODEL_BASE_URL") or "").strip()
+    if not chat_url and base_url:
+        chat_url = base_url.rstrip("/") + "/chat/completions"
+    if chat_url and not chat_url.rstrip("/").endswith("/chat/completions"):
+        chat_url = chat_url.rstrip("/") + "/chat/completions"
+
+    api_key = (os.getenv("MODEL_API_KEY") or "").strip()
+    model = (os.getenv("MODEL_NAME") or "").strip()
+    if not (chat_url and api_key and model):
+        return None
+
+    package_id = (os.getenv("PACKAGE_ID") or "").strip() or (os.getenv("packageId") or "").strip()
+    return {"url": chat_url, "api_key": api_key, "model": model, "package_id": package_id}
+
+
+def _call_model(config: Dict[str, str], prompt: str, timeout: int) -> str:
+    """Text-only gateway call; the injectable seam for offline tests."""
+    import http.client
+    import urllib.request
+
+    payload = {
+        "model": config["model"],
+        "temperature": 0.0,
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": _env_bool("AGENT_DEMO_ENABLE_THINKING", False)},
+        "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Authorization": "Bearer %s" % config["api_key"],
+        "Content-Type": "application/json",
+    }
+    if config["package_id"]:
+        headers["package_id"] = config["package_id"]
+        headers["packageId"] = config["package_id"]
+
+    request = urllib.request.Request(config["url"], data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+    except http.client.RemoteDisconnected:
+        raise RuntimeError("gateway disconnected")
+    return _extract_model_content(raw)
+
+
+def _extract_model_content(raw: str) -> str:
+    data = json.loads(raw)
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError("gateway returned no choices")
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, list):
+        parts = [p.get("text", "") for p in content if isinstance(p, dict)]
+        return "".join(parts)
+    return str(content or "")
+
+
+_RESCUE_PROMPT = """你是采购数据清洗审核员。下面这条 PO 被自动规则判定为“无法唯一确认、不计入汇总”，请你按题目规则重新人工判断。
+
+【题目清洗规则】
+{rules}
+
+【PO 系统录入行】
+{po_row}
+
+【该 PO 的全部附件文本（含 OCR）】
+{evidence}
+
+【供应商主数据 vendors.csv 可选 vendor_id】
+{vendor_ids}
+
+【品类表 category_taxonomy.csv 可选 category_code】
+{category_codes}
+
+请判断该 PO 是否应计入 2026 年 CNY 汇总。只有供应商、品类、金额、币种全部能唯一确认且符合规则时才计入。
+只输出一个 JSON 对象，不要其他文字：
+{{"countable": true或false, "vendor_id": "来自可选列表", "category_code": "来自可选列表", "amount": 整数, "currency": "CNY", "reason": "一句话"}}
+不计入时 countable 为 false，其余字段可留空。"""
+
+
+def llm_rescue_po(
+    config: Dict[str, str],
+    rules: str,
+    po: Dict[str, str],
+    evidence_texts: List[str],
+    vendor_ids: List[str],
+    category_codes: List[str],
+    timeout: int,
+) -> Optional[Tuple[str, str, int]]:
+    """Ask the model to re-judge one dropped PO. Strict acceptance: countable
+    with a known vendor_id, a known category_code, CNY and a positive integer
+    amount — anything else keeps the PO dropped."""
+    prompt = _RESCUE_PROMPT.format(
+        rules=rules.strip() or "（题面规则缺失：按常规采购清洗规则判断）",
+        po_row=json.dumps(po, ensure_ascii=False),
+        evidence="\n\n---（附件分隔）---\n\n".join(evidence_texts) or "（无附件）",
+        vendor_ids=", ".join(vendor_ids),
+        category_codes=", ".join(category_codes),
+    )
+    try:
+        response = _call_model(config, prompt, timeout)
+        match = re.search(r"\{.*\}", response, re.DOTALL)
+        if not match:
+            return None
+        data = json.loads(match.group(0))
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not data.get("countable"):
+        return None
+    vendor_id = str(data.get("vendor_id") or "").strip()
+    category = str(data.get("category_code") or "").strip()
+    currency = str(data.get("currency") or "").strip().upper()
+    try:
+        amount = int(data.get("amount"))
+    except (TypeError, ValueError):
+        return None
+    if vendor_id not in vendor_ids or category not in category_codes:
+        return None
+    if currency != "CNY" or amount <= 0:
+        return None
+    return vendor_id, category, amount
+
+
 def answer(
     args: Dict[str, Any],
     ocr_reader: Callable[[str], str] = ocr_image_text,
 ) -> Dict[str, Any]:
     runtime = args.get("_runtime") if isinstance(args.get("_runtime"), dict) else {}
     source_dir = resolve_source_dir(str(args.get("source_dir") or ""), runtime)
+    task_description = str(args.get("task_description") or "")
     do_ocr = args.get("do_ocr", True)
     if not isinstance(do_ocr, bool):
         do_ocr = str(do_ocr).strip().lower() not in {"0", "false", "no", "off", ""}
@@ -398,13 +551,55 @@ def answer(
 
     totals: Dict[Tuple[str, str], int] = defaultdict(int)
     included: List[str] = []
+    dropped: List[Dict[str, str]] = []
     for po in pos:
         cleaned = clean_po(po, vendors, valid_categories, manifest_by_id, source_dir, do_ocr, ocr_reader)
         if cleaned is None:
+            dropped.append(po)
             continue
         vendor_id, category_code, amount = cleaned
         totals[(vendor_id, category_code)] += amount
         included.append(po.get("po_id", ""))
+
+    # Rescue pass over dropped POs only (code-accepted POs stay as-is).
+    rescued: List[str] = []
+    config = _model_config()
+    if config is not None and dropped and _env_bool("PURCHASE_CLEAN_RESCUE", True):
+        from concurrent.futures import ThreadPoolExecutor
+
+        timeout = _env_int("AGENT_DEMO_TIMEOUT_SECONDS", 60, minimum=5)
+        workers = _env_int("PURCHASE_CLEAN_WORKERS", 4, minimum=1)
+        vendor_ids = sorted(vendors.keys())
+        category_codes = sorted(valid_categories)
+
+        def rescue_one(po: Dict[str, str]) -> Optional[Tuple[str, Tuple[str, str, int]]]:
+            evidence = load_evidence_texts(source_dir, po, manifest_by_id, do_ocr, ocr_reader)
+            verdict = llm_rescue_po(
+                config,
+                task_description,
+                po,
+                [item["text"] for item in evidence],
+                vendor_ids,
+                category_codes,
+                timeout,
+            )
+            if verdict is None:
+                return None
+            return po.get("po_id", ""), verdict
+
+        if workers <= 1 or len(dropped) == 1:
+            outcomes = [rescue_one(po) for po in dropped]
+        else:
+            with ThreadPoolExecutor(max_workers=min(workers, len(dropped))) as pool:
+                outcomes = list(pool.map(rescue_one, dropped))
+
+        for outcome in outcomes:
+            if outcome is None:
+                continue
+            po_id, (vendor_id, category_code, amount) = outcome
+            totals[(vendor_id, category_code)] += amount
+            included.append(po_id)
+            rescued.append(po_id)
 
     output = []
     for query in queries:
@@ -412,7 +607,7 @@ def answer(
             output.append("0")
             continue
         output.append(str(totals[(query.get("vendor_id", ""), query.get("category_code", ""))]))
-    return {"answer": ",".join(output), "included": included}
+    return {"answer": ",".join(output), "included": included, "rescued": rescued}
 
 
 def main() -> None:
