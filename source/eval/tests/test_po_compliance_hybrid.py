@@ -92,6 +92,9 @@ class ThresholdAndDatesTest(unittest.TestCase):
         self.assertEqual(
             self.module.parse_amount_threshold("达到或超过 50,000 元的 PO"), 50000
         )
+        self.assertEqual(
+            self.module.parse_amount_threshold("审计 amount_cny 在 70,000 CNY 以上的 PO"), 70000
+        )
         self.assertIsNone(self.module.parse_amount_threshold("没有提到任何数"))
 
     def test_expanded_date_formats(self) -> None:
@@ -146,35 +149,34 @@ class HybridAuditTest(unittest.TestCase):
         def handler(config, prompt, timeout):
             if "状态字段需要分类" in prompt:
                 return json.dumps({"已终审归档": "terminal"}, ensure_ascii=False)
-            if "PO-1" in prompt:
+            if "批量审查" in prompt:
                 # VP approval, in-window date, all items -> compliant
                 return json.dumps(
                     {
-                        "items_all_in_scope": True,
-                        "approvals": [
-                            {
-                                "sender_email": "vp@corp.com",
-                                "date": "2026-03-05",
-                                "explicitly_approves_this_po": True,
-                                "approves_all_items": True,
-                            }
-                        ],
-                    }
-                )
-            if "PO-4" in prompt:
-                # The model says "approved", but the sender is a Manager:
-                # code-side role validation must still fail this PO.
-                return json.dumps(
-                    {
-                        "items_all_in_scope": False,
-                        "approvals": [
-                            {
-                                "sender_email": "mgr@corp.com",
-                                "date": "2026-03-05",
-                                "explicitly_approves_this_po": True,
-                                "approves_all_items": True,
-                            }
-                        ],
+                        "PO-1": {
+                            "items_all_in_scope": True,
+                            "approvals": [
+                                {
+                                    "sender_email": "vp@corp.com",
+                                    "date": "2026-03-05",
+                                    "explicitly_approves_this_po": True,
+                                    "approves_all_items": True,
+                                }
+                            ],
+                        },
+                        "PO-4": {
+                            # The model says "approved", but the sender is a Manager:
+                            # code-side role validation must still fail this PO.
+                            "items_all_in_scope": False,
+                            "approvals": [
+                                {
+                                    "sender_email": "mgr@corp.com",
+                                    "date": "2026-03-05",
+                                    "explicitly_approves_this_po": True,
+                                    "approves_all_items": True,
+                                }
+                            ],
+                        },
                     }
                 )
             raise AssertionError("unexpected prompt")
@@ -192,23 +194,137 @@ class HybridAuditTest(unittest.TestCase):
         def handler(config, prompt, timeout):
             if "状态字段需要分类" in prompt:
                 return json.dumps({"已终审归档": "terminal"}, ensure_ascii=False)
-            return json.dumps(
-                {
-                    "items_all_in_scope": True,
-                    "approvals": [
-                        {
-                            "sender_email": "oldvp@corp.com",  # VP expired in 2025
-                            "date": "2026-03-05",
-                            "explicitly_approves_this_po": True,
-                            "approves_all_items": True,
-                        }
-                    ],
-                }
-            )
+            if "批量审查" in prompt:
+                return json.dumps(
+                    {
+                        "PO-1": {
+                            "items_all_in_scope": True,
+                            "approvals": [
+                                {
+                                    "sender_email": "oldvp@corp.com",  # VP expired in 2025
+                                    "date": "2026-03-05",
+                                    "explicitly_approves_this_po": True,
+                                    "approves_all_items": True,
+                                }
+                            ],
+                        },
+                        "PO-4": {
+                            "items_all_in_scope": True,
+                            "approvals": [
+                                {
+                                    "sender_email": "oldvp@corp.com",
+                                    "date": "2026-03-05",
+                                    "explicitly_approves_this_po": True,
+                                    "approves_all_items": True,
+                                }
+                            ],
+                        },
+                    }
+                )
+            raise AssertionError("unexpected prompt")
 
         result = self._run(handler)
         # Both deep-audited POs only carry an expired-VP approval -> both bad.
         self.assertEqual(result["answer"], "PO-1,PO-4")
+
+    def test_status_model_can_override_keyword_hit(self) -> None:
+        def handler(config, prompt, timeout):
+            if "状态字段需要分类" in prompt:
+                return json.dumps(
+                    {
+                        "已终审归档": "non_terminal",
+                        "已完成": "terminal",
+                        "审批中": "non_terminal",
+                        "已完成待法务复核": "non_terminal",
+                    },
+                    ensure_ascii=False,
+                )
+            raise AssertionError("no PO should reach deep audit")
+
+        self.module._model_config = lambda: {
+            "url": "u", "api_key": "k", "model": "m", "package_id": "",
+        }
+        self.module._call_model = handler
+        with tempfile.TemporaryDirectory() as tmp:
+            source = _write_fixture(Path(tmp))
+            csv_path = source / "purchase_orders_raw.csv"
+            csv_path.write_text(
+                csv_path.read_text(encoding="utf-8").replace(
+                    "PO-4,2026-03-10,已完成,120000",
+                    "PO-4,2026-03-10,已完成待法务复核,120000",
+                ),
+                encoding="utf-8",
+            )
+            result = self.module.answer(
+                {"task_description": TASK_TEXT_60K, "source_dir": str(source), "_runtime": {}}
+            )
+
+        self.assertEqual(result["deep_audited"], 0)
+        self.assertEqual(result["answer"], "")
+
+    def test_batch_audit_can_overrule_code_compliant_po(self) -> None:
+        def handler(config, prompt, timeout):
+            if "状态字段需要分类" in prompt:
+                return json.dumps({"已终审归档": "terminal"}, ensure_ascii=False)
+            if "批量审查" in prompt:
+                return json.dumps(
+                    {
+                        "PO-1": {
+                            "items_all_in_scope": "false",
+                            "approvals": [
+                                {
+                                    "sender_email": "vp@corp.com",
+                                    "date": "2026-03-05",
+                                    "explicitly_approves_this_po": "true",
+                                    "approves_all_items": "true",
+                                }
+                            ],
+                        }
+                    }
+                )
+            raise AssertionError("unexpected prompt")
+
+        self.module._model_config = lambda: {
+            "url": "u", "api_key": "k", "model": "m", "package_id": "",
+        }
+        self.module._call_model = handler
+        with tempfile.TemporaryDirectory() as tmp:
+            source = _write_fixture(Path(tmp))
+            csv_path = source / "purchase_orders_raw.csv"
+            csv_path.write_text(
+                csv_path.read_text(encoding="utf-8").replace(
+                    "PO-4,2026-03-10,已完成,120000",
+                    "PO-4,2026-03-10,已完成,30000",
+                ),
+                encoding="utf-8",
+            )
+            (source / "evidence" / "e1.txt").write_text(
+                "From: 张总 <vp@corp.com>\n"
+                "Date: 2026.03.05\n"
+                "关于 PO-1：服务器采购，完整清单均已看过并批准。\n",
+                encoding="utf-8",
+            )
+            result = self.module.answer(
+                {"task_description": TASK_TEXT_60K, "source_dir": str(source), "_runtime": {}}
+            )
+
+        self.assertEqual(result["answer"], "PO-1")
+        self.assertEqual(result["batch_judged"], 1)
+
+    def test_threshold_can_come_from_audit_rules_file(self) -> None:
+        self.module._model_config = lambda: None
+        with tempfile.TemporaryDirectory() as tmp:
+            source = _write_fixture(Path(tmp))
+            (source / "audit_rules.md").write_text(
+                "只审计状态有效且 amount_cny 在 100000 CNY 以上的 PO。\n",
+                encoding="utf-8",
+            )
+            result = self.module.answer(
+                {"task_description": "请按规则文件审计 PO", "source_dir": str(source), "_runtime": {}}
+            )
+
+        self.assertEqual(result["threshold"], 100000)
+        self.assertEqual(result["deep_audited"], 1)
 
     def test_model_failure_falls_back_to_code_path(self) -> None:
         def handler(config, prompt, timeout):

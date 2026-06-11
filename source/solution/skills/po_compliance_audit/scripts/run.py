@@ -130,6 +130,58 @@ def read_text(path: str) -> str:
         return raw.decode("utf-8", errors="replace")
 
 
+def read_optional_text(path: str) -> str:
+    if not os.path.isfile(path):
+        return ""
+    return read_text(path)
+
+
+def read_audit_rules(source_dir: str) -> str:
+    return read_optional_text(os.path.join(source_dir, "audit_rules.md"))
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Extract the first balanced JSON object from a model response."""
+    start = text.find("{")
+    while start >= 0:
+        depth = 0
+        in_string = False
+        escape = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        data = json.loads(text[start:index + 1])
+                    except json.JSONDecodeError:
+                        break
+                    return data if isinstance(data, dict) else None
+        start = text.find("{", start + 1)
+    return None
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    return text in {"true", "yes", "y", "1", "是", "对", "正确", "通过"}
+
+
 def parse_iso(value: str) -> date:
     y, m, d = [int(part) for part in value.split("-")]
     return date(y, m, d)
@@ -195,7 +247,14 @@ def is_terminal_status(status: str) -> Optional[bool]:
     return None
 
 
-_STATUS_PROMPT = """采购 PO 的状态字段需要分类。规则：只有语义上明确表示“已结束/已完成/已支付/已验收/已关闭/已结案”的状态算 terminal；草稿、评审中、审批中、待补件、取消、作废等未结束或已取消状态算 non_terminal。
+_STATUS_PROMPT = """采购 PO 的状态字段需要分类。
+
+【审计规则原文】
+{policy}
+
+【分类规则】
+只有语义上明确表示“已结束/已完成/已支付/已验收/已关闭/已结案”的状态算 terminal；草稿、评审中、审批中、待补件、取消、作废等未结束或已取消状态算 non_terminal。
+如果一个状态同时包含完成词和待复核/补件/撤销/作废/取消等限制词，以未完成或无效语义为准，输出 non_terminal。
 
 待分类状态词（每行一个）：
 {words}
@@ -203,20 +262,30 @@ _STATUS_PROMPT = """采购 PO 的状态字段需要分类。规则：只有语�
 只输出一个 JSON 对象，key 为状态词原文，value 为 "terminal" 或 "non_terminal"，不要输出其他文字。"""
 
 
-def classify_unknown_statuses(
-    config: Optional[Dict[str, str]], words: List[str], timeout: int, warnings: List[str]
+def classify_statuses(
+    config: Optional[Dict[str, str]],
+    words: List[str],
+    policy_text: str,
+    timeout: int,
+    warnings: List[str],
 ) -> Dict[str, bool]:
-    """One batched model call for status words the keyword lists cannot judge."""
+    """One batched model call for status words.
+
+    In online runs this is intentionally allowed to classify known keyword hits
+    too: hidden variants may contain mixed phrases such as "completed-pending".
+    """
     verdicts: Dict[str, bool] = {}
     if not words:
         return verdicts
     if config is None:
-        warnings.append("status words unknown to keyword lists treated as non-terminal: %s" % words)
         return verdicts
     try:
-        response = _call_model(config, _STATUS_PROMPT.format(words="\n".join(words)), timeout)
-        match = re.search(r"\{.*\}", response, re.DOTALL)
-        data = json.loads(match.group(0)) if match else {}
+        response = _call_model(
+            config,
+            _STATUS_PROMPT.format(policy=policy_text or "（无额外规则文件）", words="\n".join(words)),
+            timeout,
+        )
+        data = _extract_json_object(response) or {}
         for word in words:
             value = str(data.get(word, "")).strip().lower()
             if value in {"terminal", "non_terminal"}:
@@ -226,10 +295,18 @@ def classify_unknown_statuses(
     return verdicts
 
 
+def classify_unknown_statuses(
+    config: Optional[Dict[str, str]], words: List[str], timeout: int, warnings: List[str]
+) -> Dict[str, bool]:
+    return classify_statuses(config, words, "", timeout, warnings)
+
+
 def parse_amount_threshold(task_description: str) -> Optional[int]:
     """Pull the deep-audit amount threshold out of the question text."""
     for pattern in (
         r"(?:达到或超过|不低于|大于等于|至少|超过|>=|≥)\s*([0-9][0-9,]*(?:\.\d+)?)\s*(?:CNY|元|人民币)",
+        r"(?:amount_cny|金额)[^0-9]{0,20}([0-9][0-9,]*(?:\.\d+)?)\s*(?:CNY|元|人民币)\s*(?:以上|及以上|或以上|起)?",
+        r"([0-9][0-9,]*(?:\.\d+)?)\s*(?:CNY|元|人民币)\s*(?:以上|及以上|或以上|起)",
         r"amount_cny\s*(?:达到或超过|不低于|>=|≥)\s*([0-9][0-9,]*(?:\.\d+)?)",
     ):
         match = re.search(pattern, task_description)
@@ -507,6 +584,105 @@ service_items: {service_items}
 若附件中没有任何批准表态，approvals 输出空数组。"""
 
 
+_BATCH_DEEP_AUDIT_PROMPT = """你是采购合规审计员。请批量审查下面所有 PO 的供应商范围和审批文本，输出 JSON 对象。
+
+【审计规则原文】
+{policy}
+
+【待深审 PO 列表】
+{payload}
+
+【判断要求】
+1. items_all_in_scope：该 PO 的 service_items 是否全部属于 vendor_service_scope。需要语义判断，措辞可能不同；任一关键采购内容不属于则为 false。
+2. approvals：逐一抽取附件中“对当前 PO 的明确批准表态”。注意只抽当前 PO：
+   - 附件里出现多个 PO 时，批准其他 PO 不能算当前 PO；
+   - “考虑一下”“先评估”“待补材料”“只批准其中一项”“剩余项另行确认”等都不是完整有效批准；
+   - 多轮转发/追问时，按每一轮的发件人、日期、表态分别判断；
+   - approves_all_items 仅当该表态明确覆盖当前 PO 的全部 service_items 时为 true。
+
+只输出一个 JSON 对象，不要输出解释。对象 key 必须是 po_id，value 格式如下：
+{{"PO-xxx": {{"items_all_in_scope": true或false, "approvals": [{{"sender_email": "发件人邮箱", "date": "yyyy-mm-dd", "explicitly_approves_this_po": true或false, "approves_all_items": true或false}}]}}}}
+若某个 PO 没有任何批准表态，approvals 输出空数组。不要省略任何输入 PO。"""
+
+
+def _clip_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n...[truncated]..."
+
+
+def _deep_audit_payload(
+    pos: List[Dict[str, str]],
+    vendors: Dict[str, Dict[str, str]],
+    evidence_by_po: Dict[str, List[str]],
+) -> str:
+    payload: List[Dict[str, Any]] = []
+    for po in pos:
+        vendor = vendors.get(po.get("vendor_id", ""))
+        payload.append(
+            {
+                "po_id": po.get("po_id", ""),
+                "po_date": po.get("po_date", ""),
+                "vendor_id": po.get("vendor_id", ""),
+                "vendor_name": po.get("vendor_name", "") or (vendor or {}).get("vendor_name", ""),
+                "service_items": po.get("service_items", ""),
+                "vendor_service_scope": (vendor or {}).get("service_scope", "（vendors.csv 中无此供应商）"),
+                "approval_evidence_texts": [
+                    _clip_text(text, 12000) for text in evidence_by_po.get(po.get("po_id", ""), [])
+                ],
+            }
+        )
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _normalise_deep_audit_verdicts(data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    verdicts: Dict[str, Dict[str, Any]] = {}
+
+    def add(po_id: str, value: Any) -> None:
+        if not po_id or not isinstance(value, dict):
+            return
+        if "items_all_in_scope" not in value:
+            return
+        approvals = value.get("approvals")
+        verdicts[po_id] = {
+            "items_all_in_scope": _as_bool(value.get("items_all_in_scope")),
+            "approvals": approvals if isinstance(approvals, list) else [],
+        }
+
+    results = data.get("results")
+    if isinstance(results, list):
+        for item in results:
+            if isinstance(item, dict):
+                add(str(item.get("po_id") or ""), item)
+
+    for key, value in data.items():
+        if key == "results":
+            continue
+        add(str(key), value)
+    return verdicts
+
+
+def llm_batch_deep_audit(
+    config: Dict[str, str],
+    pos: List[Dict[str, str]],
+    vendors: Dict[str, Dict[str, str]],
+    evidence_by_po: Dict[str, List[str]],
+    policy_text: str,
+    timeout: int,
+) -> Dict[str, Dict[str, Any]]:
+    if not pos:
+        return {}
+    prompt = _BATCH_DEEP_AUDIT_PROMPT.format(
+        policy=policy_text or "（无额外规则文件）",
+        payload=_deep_audit_payload(pos, vendors, evidence_by_po),
+    )
+    response = _call_model(config, prompt, timeout)
+    data = _extract_json_object(response)
+    if not data:
+        return {}
+    return _normalise_deep_audit_verdicts(data)
+
+
 def llm_deep_audit(
     config: Dict[str, str],
     po: Dict[str, str],
@@ -526,14 +702,14 @@ def llm_deep_audit(
     )
     try:
         response = _call_model(config, prompt, timeout)
-        match = re.search(r"\{.*\}", response, re.DOTALL)
-        if not match:
-            return None
-        data = json.loads(match.group(0))
+        data = _extract_json_object(response)
     except Exception:
         return None
     if not isinstance(data, dict) or "items_all_in_scope" not in data:
         return None
+    data["items_all_in_scope"] = _as_bool(data.get("items_all_in_scope"))
+    if not isinstance(data.get("approvals"), list):
+        data["approvals"] = []
     return data
 
 
@@ -550,7 +726,7 @@ def _approval_ok_from_llm(
     for item in verdict.get("approvals") or []:
         if not isinstance(item, dict):
             continue
-        if not item.get("explicitly_approves_this_po") or not item.get("approves_all_items"):
+        if not _as_bool(item.get("explicitly_approves_this_po")) or not _as_bool(item.get("approves_all_items")):
             continue
         email = str(item.get("sender_email") or "").strip()
         sent = parse_date_text(str(item.get("date") or ""))
@@ -565,6 +741,8 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
     runtime = args.get("_runtime") if isinstance(args.get("_runtime"), dict) else {}
     source_dir = resolve_source_dir(str(args.get("source_dir") or ""), runtime)
     task_description = str(args.get("task_description") or "")
+    audit_rules_text = read_audit_rules(source_dir)
+    policy_text = "\n\n".join(part for part in [task_description, audit_rules_text] if part.strip())
     pos = read_csv(os.path.join(source_dir, "purchase_orders_raw.csv"))
     vendors = {row["vendor_id"]: row for row in read_csv(os.path.join(source_dir, "vendors.csv"))}
     roles = load_roles(read_csv(os.path.join(source_dir, "people_roles.csv")))
@@ -575,6 +753,7 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
     config = _model_config()
     gateway_timeout = _env_int("AGENT_DEMO_TIMEOUT_SECONDS", 60, minimum=5)
     timeout = _env_int("PO_AUDIT_MODEL_TIMEOUT_SECONDS", min(gateway_timeout, 8), minimum=3)
+    batch_timeout = _env_int("PO_AUDIT_BATCH_TIMEOUT_SECONDS", min(gateway_timeout, max(timeout, 20)), minimum=5)
     workers = _env_int("PO_AUDIT_WORKERS", 1, minimum=1)
     llm_rescue_left = [_env_int("PO_AUDIT_LLM_MAX_PO", 4, minimum=0)]
     llm_rescue_lock = threading.Lock()
@@ -584,27 +763,37 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
     budget = _env_int("SKILL_BUDGET_SECONDS", DEFAULT_BUDGET_SECONDS, minimum=1)
     deadline = time.monotonic() + budget - EMIT_MARGIN_SECONDS
 
-    threshold = parse_amount_threshold(task_description)
+    threshold = parse_amount_threshold(policy_text)
     if threshold is None:
         threshold = 50000
-        if task_description:
+        if policy_text:
             warnings.append("amount threshold not found in question text; defaulting to 50000")
 
-    # --- status screen: keyword lists first, one batched model call for the rest
+    # --- status screen: online runs classify all statuses so mixed hidden
+    # variants can override simple keyword hits; offline keeps the code path.
+    all_status_words: List[str] = []
     unknown_words: List[str] = []
     for po in pos:
-        status = po.get("status", "")
-        if is_terminal_status(status) is None and status.strip() and status not in unknown_words:
+        status = po.get("status", "").strip()
+        if status and status not in all_status_words:
+            all_status_words.append(status)
+        if is_terminal_status(status) is None and status and status not in unknown_words:
             unknown_words.append(status)
-    llm_status = classify_unknown_statuses(
-        config, unknown_words, _clamped_timeout(timeout, deadline), warnings
+    if config is None and unknown_words:
+        warnings.append("status words unknown to keyword lists treated as non-terminal: %s" % unknown_words)
+    llm_status = classify_statuses(
+        config, all_status_words if config is not None else [],
+        policy_text, _clamped_timeout(timeout, deadline), warnings
     )
 
     def status_is_terminal(status: str) -> bool:
-        verdict = is_terminal_status(status)
+        key = status.strip()
+        if key in llm_status:
+            return llm_status[key]
+        verdict = is_terminal_status(key)
         if verdict is not None:
             return verdict
-        return llm_status.get(status, False)
+        return False
 
     deep: List[Dict[str, str]] = []
     for po in pos:
@@ -616,7 +805,12 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
             deep.append(po)
 
     # --- per-PO deep audit ---------------------------------------------------
+    evidence_cache: Dict[str, List[str]] = {}
+
     def evidence_for(po: Dict[str, str]) -> List[str]:
+        po_id = po.get("po_id", "")
+        if po_id in evidence_cache:
+            return evidence_cache[po_id]
         texts: List[str] = []
         for evidence_id in [part.strip() for part in po.get("evidence_ids", "").split(";") if part.strip()]:
             row = evidence_by_id.get(evidence_id)
@@ -625,7 +819,23 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
             path = os.path.join(source_dir, row.get("file_path", ""))
             if os.path.isfile(path):
                 texts.append(read_text(path))
+        evidence_cache[po_id] = texts
         return texts
+
+    batch_verdicts: Dict[str, Dict[str, Any]] = {}
+    batch_skipped_deadline = False
+    if config is not None and deep:
+        if _remaining_seconds(deadline) < DEEP_AUDIT_MIN_SECONDS:
+            batch_skipped_deadline = True
+        else:
+            try:
+                evidence_by_po = {po.get("po_id", ""): evidence_for(po) for po in deep}
+                batch_verdicts = llm_batch_deep_audit(
+                    config, deep, vendors, evidence_by_po, policy_text,
+                    _clamped_timeout(batch_timeout, deadline),
+                )
+            except Exception as exc:
+                warnings.append("batch deep audit call failed: %s" % exc)
 
     def audit_one(po: Dict[str, str]) -> Tuple[str, bool, str]:
         """Returns (po_id, is_compliant, judged_by)."""
@@ -635,6 +845,13 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
 
         scope_ok = bool(vendor) and service_scope_ok(po, vendor.get("service_scope", ""))
         approval_ok = has_valid_approval(po, texts, roles)
+
+        verdict = batch_verdicts.get(po_id)
+        if verdict is not None:
+            scope_ok = bool(vendor) and _as_bool(verdict.get("items_all_in_scope"))
+            approval_ok = _approval_ok_from_llm(po, verdict, roles)
+            return po_id, scope_ok and approval_ok, "llm-batch"
+
         if scope_ok and approval_ok:
             return po_id, True, "code"
 
@@ -673,6 +890,7 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
     bad: List[str] = []
     judged_by_code = 0
     judged_by_deadline = 0
+    judged_by_batch = 0
     for outcome in results:
         if outcome is None:
             continue
@@ -681,13 +899,17 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
             judged_by_code += 1
         elif judged_by == "code-deadline":
             judged_by_deadline += 1
+        elif judged_by == "llm-batch":
+            judged_by_batch += 1
         if not compliant and po_id:
             bad.append(po_id)
 
     if config is None:
         warnings.append("model gateway not configured; deep audit ran on code keyword rules only")
+    elif batch_skipped_deadline:
+        warnings.append("batch deep audit skipped because deadline was near")
     elif judged_by_code:
-        warnings.append("%d/%d POs judged by code fallback (model call failed)" % (judged_by_code, len(deep)))
+        warnings.append("%d/%d POs judged by code fallback (no batch verdict)" % (judged_by_code, len(deep)))
     if judged_by_deadline:
         warnings.append("%d/%d POs judged by code fallback (deadline reached)" % (judged_by_deadline, len(deep)))
 
@@ -697,6 +919,7 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
         "count": len(bad),
         "threshold": threshold,
         "deep_audited": len(deep),
+        "batch_judged": judged_by_batch,
         "warnings": warnings,
     }
 
