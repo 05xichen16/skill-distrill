@@ -97,13 +97,25 @@ class ContestantAgent:
                 yield path
 
     def _image_blocks(self, context: AgentContext) -> list[dict[str, Any]]:
+        # Safety caps: a directory file may resolve to many images (e.g. a
+        # training/validation folder). Bound count and total bytes so a single
+        # request can't blow up context or token cost; log when we truncate.
+        max_images = env_int("AGENT_DEMO_MAX_IMAGES", 6)
+        max_total_bytes = max(1, env_int("AGENT_DEMO_MAX_IMAGE_MB", 12)) * 1024 * 1024
+        all_images = list(self._iter_image_files(context))
         blocks: list[dict[str, Any]] = []
-        for path in self._iter_image_files(context):
+        total_bytes = 0
+        for path in all_images:
+            if len(blocks) >= max_images:
+                break
             try:
                 raw = path.read_bytes()
             except OSError as exc:
                 print(f"failed to read image {path}: {exc}", file=sys.stderr)
                 continue
+            if blocks and total_bytes + len(raw) > max_total_bytes:
+                break
+            total_bytes += len(raw)
             mime = IMAGE_MIME_TYPES.get(path.suffix.lower(), "image/png")
             encoded = base64.b64encode(raw).decode("ascii")
             blocks.append(
@@ -111,6 +123,13 @@ class ContestantAgent:
                     "type": "image_url",
                     "image_url": {"url": f"data:{mime};base64,{encoded}"},
                 }
+            )
+        if len(all_images) > len(blocks):
+            print(
+                f"attached {len(blocks)}/{len(all_images)} declared images "
+                f"(cap: AGENT_DEMO_MAX_IMAGES={max_images}, "
+                f"AGENT_DEMO_MAX_IMAGE_MB={max_total_bytes // (1024 * 1024)})",
+                file=sys.stderr,
             )
         return blocks
 
