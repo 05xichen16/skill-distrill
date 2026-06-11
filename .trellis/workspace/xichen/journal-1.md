@@ -72,3 +72,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: 阶段B-1_2: 编程规范问答 spec_qa skill (止方差,稳定满分2.0/2)
+
+**Date**: 2026-06-11
+**Task**: 阶段B-1_2: 编程规范问答 spec_qa skill (止方差,稳定满分2.0/2)
+**Branch**: `develop`
+
+### Summary
+
+新增通用文档接地 QA skill spec_qa(动态解析题面 N 子问题→按【X规范】路由到规范.md→关键词检索片段→逐问单独调模型答→代码用;拼恰好N段)。把 1_2 从 baseline 1.4(且 0.2↔1.4 乱跳)做成稳定满分 2.0/2。关键调参:检索片段必须大(SPEC_QA_SNIPPET_CHARS=25000,小片段让中文文档里英文提问命不中→模型答未提及只0.8);build_prompt 优先文档否则用知识(救文档覆盖稀疏题如 None 比较用 is/is not)。+26 单测(全套53绿)。DashScope 实测:直接跑3次全2.0/spread=0;完整 agent 链路模型自主 skill_run 也 2.0。回归台 exit0 白送分1_1/1_3/3_2不回归。投影总分 19.436→21.236/32。本任务按用户要求跳过 trellis-check,改用离线单测+3次跑验零方差+完整链路+回归把关。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ba7c22a` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
