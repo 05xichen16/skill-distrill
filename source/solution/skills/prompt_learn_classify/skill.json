@@ -1,0 +1,29 @@
+{
+  "name": "prompt_learn_classify",
+  "description": "Prompt-learning image classifier: learn the label set from a labelled training set, then classify every image in a validation set one-by-one against a task description. Generic - labels, class count and validation size are all derived from the inputs, never hard-coded. Output is the per-image answer string '<i><LABEL>' joined by commas in numeric order.",
+  "entrypoint": "scripts/run.py",
+  "timeout_seconds": 1800,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "task_description": {
+        "type": "string",
+        "description": "The question's task/classification rule, verbatim. The model uses this as the decision rule for every validation image."
+      },
+      "train_dir": {
+        "type": "string",
+        "description": "Name (or path) of the training-set directory declared in the question (e.g. the labelled set). Relative names resolve against the question directory. Optional; inferred from the question's files when omitted."
+      },
+      "val_dir": {
+        "type": "string",
+        "description": "Name (or path) of the validation-set directory to classify (unlabelled). Relative names resolve against the question directory. Optional; inferred from the question's files when omitted."
+      },
+      "few_shot_k": {
+        "type": "integer",
+        "description": "Number of training examples (balanced across classes) to attach as few-shot exemplars to each prompt. Defaults to 0 (zero-shot)."
+      }
+    },
+    "required": ["task_description"],
+    "additionalProperties": true
+  }
+}

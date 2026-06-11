@@ -87,9 +87,30 @@ class ContestantAgent:
         return env_bool("AGENT_DEMO_ENABLE_THINKING", True)
 
     def _iter_image_files(self, context: AgentContext):
+        # Only directly-declared image files are auto-injected. A declared
+        # *directory* (dataset task, e.g. 3_1's training/validation folders)
+        # is left for a skill to walk image-by-image: injecting the first few
+        # of its images both truncates the set and misleads the model into
+        # answering off the partial sample instead of routing to the skill.
+        # AGENT_DEMO_INJECT_DIR_IMAGES=1 restores the old directory-walk.
+        inject_dirs = env_bool("AGENT_DEMO_INJECT_DIR_IMAGES", False)
         for raw in context.allowed_file_paths:
             path = Path(raw)
             if path.is_dir():
+                if not inject_dirs:
+                    images_in_dir = sum(
+                        1
+                        for child in path.rglob("*")
+                        if child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS
+                    )
+                    if images_in_dir:
+                        print(
+                            f"skipping {images_in_dir} image(s) under declared "
+                            f"directory {path} (dataset task left to skill; "
+                            f"set AGENT_DEMO_INJECT_DIR_IMAGES=1 to inject)",
+                            file=sys.stderr,
+                        )
+                    continue
                 for child in sorted(path.rglob("*")):
                     if child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS:
                         yield child
