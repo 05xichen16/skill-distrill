@@ -234,5 +234,50 @@ class HybridAuditTest(unittest.TestCase):
         self.assertIn("PO-4", result["answer"])
 
 
+class DeadlineSelfProtectionTest(unittest.TestCase):
+    """A tiny SKILL_BUDGET_SECONDS must degrade deep audits to the code rules
+    (no per-PO model calls) yet still emit a well-formed answer."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+        self._saved = {key: os.environ.pop(key, None) for key in ENV_KEYS}
+
+    def tearDown(self) -> None:
+        os.environ.pop("SKILL_BUDGET_SECONDS", None)
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_tiny_budget_skips_deep_audit_llm(self) -> None:
+        os.environ["SKILL_BUDGET_SECONDS"] = "25"  # deadline = now + 10s, under the 15s floor
+        status_timeouts = []
+
+        def handler(config, prompt, timeout):
+            if "状态字段需要分类" in prompt:
+                status_timeouts.append(timeout)
+                return json.dumps({"已终审归档": "terminal"}, ensure_ascii=False)
+            raise AssertionError("deep audit must not call the model past the deadline")
+
+        self.module._model_config = lambda: {
+            "url": "u", "api_key": "k", "model": "m", "package_id": "",
+        }
+        self.module._call_model = handler
+        with tempfile.TemporaryDirectory() as tmp:
+            source = _write_fixture(Path(tmp))
+            result = self.module.answer(
+                {"task_description": TASK_TEXT_60K, "source_dir": str(source), "_runtime": {}}
+            )
+
+        # Both deep-audited POs (PO-1 via LLM status, PO-4) fell back to the
+        # code rules: PO-1's evidence wording is outside the keyword table and
+        # PO-4's scope fails -> both listed; the answer stays well-formed.
+        self.assertEqual(result["answer"], "PO-1,PO-4")
+        self.assertTrue(any("deadline" in w for w in result["warnings"]))
+        # the batched status call still ran, with its timeout clamped to the budget
+        self.assertTrue(status_timeouts and status_timeouts[0] <= 10)
+
+
 if __name__ == "__main__":
     unittest.main()

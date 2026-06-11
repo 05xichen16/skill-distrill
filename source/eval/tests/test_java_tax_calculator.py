@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import unittest
 from pathlib import Path
 
@@ -259,6 +260,91 @@ class AnswerFallbackChainTest(unittest.TestCase):
         self.assertEqual(len(segments), 11)
         self.assertIn("version", segments[0])
         self.assertEqual(result["path"], "unverified")
+
+
+class DeadlineSelfProtectionTest(unittest.TestCase):
+    """A tiny SKILL_BUDGET_SECONDS must skip all model work (java repair
+    rounds and the python extraction call) yet still emit a shaped answer."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    def tearDown(self) -> None:
+        os.environ.pop("SKILL_BUDGET_SECONDS", None)
+
+    def test_tiny_budget_skips_model_and_still_emits(self) -> None:
+        os.environ["SKILL_BUDGET_SECONDS"] = "25"  # deadline = now + 5s after the 20s margin
+        self.module.java_toolchain_available = lambda: True
+        self.module._model_config = lambda: {"url": "u", "api_key": "k", "model": "m", "package_id": ""}
+
+        def must_not_call(config, prompt, timeout):
+            raise AssertionError("model must not be called past the deadline")
+
+        self.module._call_model = must_not_call
+        self.module.java_version_line = lambda: 'openjdk version "21.0.11"'
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "TaxVariant.java")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("public class TaxVariant { }")
+            result = self.module.answer(
+                {"task_description": TASK_TEXT, "source_file": path, "_runtime": {}}
+            )
+
+        segments = result["answer"].split(",")
+        self.assertEqual(len(segments), 11)
+        self.assertIn("version", segments[0])
+        self.assertEqual(result["path"], "unverified")
+        self.assertTrue(any("deadline" in w for w in result["warnings"]))
+
+
+class TransientRetryTest(unittest.TestCase):
+    """_call_model retries once on 5xx/disconnects and fails fast otherwise.
+    (po_compliance_audit ships the identical retry block; tested once here.)"""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+        self.module._RETRY_SLEEP_SECONDS = 0
+        self.config = {"url": "u", "api_key": "k", "model": "m", "package_id": ""}
+        self.valid = json.dumps({"choices": [{"message": {"content": "ok"}}]})
+
+    def test_5xx_then_success(self) -> None:
+        attempts = []
+
+        def fake_post(url, body, headers, timeout):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("gateway HTTP 500: boom")
+            return self.valid
+
+        self.module._post_model_request = fake_post
+        self.assertEqual(self.module._call_model(self.config, "p", 5), "ok")
+        self.assertEqual(len(attempts), 2)
+
+    def test_4xx_fails_fast(self) -> None:
+        attempts = []
+
+        def fake_post(url, body, headers, timeout):
+            attempts.append(1)
+            raise RuntimeError("gateway HTTP 401: denied")
+
+        self.module._post_model_request = fake_post
+        with self.assertRaises(RuntimeError):
+            self.module._call_model(self.config, "p", 5)
+        self.assertEqual(len(attempts), 1)
+
+    def test_transient_classifier(self) -> None:
+        import urllib.error
+
+        is_transient = self.module._is_transient_gateway_error
+        self.assertTrue(is_transient(urllib.error.HTTPError("u", 502, "bad", {}, None)))
+        self.assertFalse(is_transient(urllib.error.HTTPError("u", 404, "nf", {}, None)))
+        self.assertTrue(is_transient(urllib.error.URLError("down")))
+        self.assertTrue(is_transient(RuntimeError("gateway HTTP 503: x")))
+        self.assertFalse(is_transient(RuntimeError("gateway HTTP 400: x")))
+        self.assertFalse(is_transient(ValueError("nope")))
 
 
 if __name__ == "__main__":

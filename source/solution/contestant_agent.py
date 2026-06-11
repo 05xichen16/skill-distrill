@@ -43,9 +43,14 @@ class ContestantAgent:
     async def solve(self, *, question: dict[str, Any], context: AgentContext) -> str:
         load_dotenv()
 
-        routed = await self._try_explicit_skill_route(question=question, context=context)
-        if routed is not None:
-            return routed
+        # Compute the route first so the skill name survives a skill failure:
+        # the model loop's final answer is then held to the same shape guard.
+        route = self._explicit_skill_route(question=question, context=context)
+        routed_skill = route[0] if route is not None else None
+        if route is not None:
+            routed = await self._try_explicit_skill_route(question=question, context=context, route=route)
+            if routed is not None:
+                return routed
 
         if not env_bool("AGENT_DEMO_USE_LLM", True):
             raise RuntimeError("AGENT_DEMO_USE_LLM is disabled; configure a model gateway or implement ContestantAgent.solve().")
@@ -72,7 +77,7 @@ class ContestantAgent:
         enable_thinking = self._should_enable_thinking(question)
 
         try:
-            return await self._run_model_loop(
+            answer = await self._run_model_loop(
                 system_prompt=SYSTEM_PROMPT,
                 user_content=user_content,
                 context=context,
@@ -80,17 +85,37 @@ class ContestantAgent:
             )
         except Exception as exc:  # last-resort safety net: never return an empty answer
             print(f"agent loop failed, falling back to direct answer: {exc}", file=sys.stderr)
-            return await self._direct_answer(user_content, enable_thinking=enable_thinking)
+            answer = await self._direct_answer(user_content, enable_thinking=enable_thinking)
 
-    async def _try_explicit_skill_route(self, *, question: dict[str, Any], context: AgentContext) -> str | None:
+        if routed_skill is None:
+            return answer
+        # The model loop replaced a known skill: its output must satisfy the
+        # same shape guard, otherwise bare CoT/truncation garbage gets submitted.
+        return await self._guarded_model_answer(
+            answer,
+            skill_name=routed_skill,
+            user_content=user_content,
+            enable_thinking=enable_thinking,
+        )
+
+    async def _try_explicit_skill_route(
+        self,
+        *,
+        question: dict[str, Any],
+        context: AgentContext,
+        route: tuple[str, dict[str, Any]] | None = None,
+    ) -> str | None:
         """Run high-confidence contest tasks through their dedicated skill.
 
         The old generic model loop is still the fallback, but these tasks have
         position-sensitive graders and established executable skills. Letting
         the model decide whether to call a skill is a major source of drift.
+        ``route`` lets solve() pass the precomputed route so the skill name
+        survives a failure (the model loop's answer is guarded against it).
         """
 
-        route = self._explicit_skill_route(question=question, context=context)
+        if route is None:
+            route = self._explicit_skill_route(question=question, context=context)
         if route is None:
             return None
 
@@ -143,6 +168,64 @@ class ContestantAgent:
             print(f"answer guard for {skill_name} crashed ({exc}); accepting answer", file=sys.stderr)
             return None
 
+    async def _guarded_model_answer(
+        self,
+        answer: str,
+        *,
+        skill_name: str,
+        user_content,
+        enable_thinking: bool,
+    ) -> str:
+        """Hold a model-loop answer to the routed skill's shape guard.
+
+        When the skill itself failed, the model loop's raw output became the
+        final answer with no quality gate (platform run #2 submitted truncated
+        bare CoT for 3_2). Rejected answers get one strict retry; the retry is
+        returned even if still rejected — but never an empty string unless
+        empty is legal for this skill.
+        """
+        rejection = self._skill_answer_guard(skill_name, answer)
+        if rejection is None:
+            return answer
+        print(
+            f"model answer for {skill_name} rejected by guard ({rejection}); "
+            "retrying once with a strict answer-only instruction",
+            file=sys.stderr,
+        )
+        try:
+            retry = await self._strict_retry(user_content, enable_thinking=enable_thinking)
+        except Exception as exc:  # noqa: BLE001 - the gate must not crash solve()
+            print(f"strict retry failed ({exc}); keeping the original model answer", file=sys.stderr)
+            return answer
+        retry_rejection = self._skill_answer_guard(skill_name, retry)
+        if retry_rejection is not None:
+            print(
+                f"strict retry for {skill_name} still rejected ({retry_rejection}); "
+                "returning the retry answer anyway",
+                file=sys.stderr,
+            )
+            if not retry.strip() and skill_name not in self._EMPTY_ANSWER_OK and answer.strip():
+                return answer
+        return retry
+
+    async def _strict_retry(self, user_content, *, enable_thinking: bool) -> str:
+        """One tool-free model call demanding the bare final answer."""
+        config = ModelConfig.from_env()
+        client = ChatCompletionClient(config)
+        text, images = self._split_user_content(user_content)
+        strict_text = text + "\n\n只输出题目要求的最终答案正文，不要任何分析、解释或思考过程。"
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": self._compose_content(strict_text, images)},
+        ]
+        completion = await client.create(
+            messages=messages,
+            tools=[],
+            tool_choice="none",
+            enable_thinking=enable_thinking,
+        )
+        return self._clean_final_answer(str(first_message(completion).get("content") or ""))
+
     def _guard_wiki_dialog(self, text: str) -> str | None:
         try:
             elements = json.loads(text)
@@ -189,6 +272,19 @@ class ContestantAgent:
         segments = [segment.strip() for segment in text.split(",")]
         if not all(re.fullmatch(r"-?\d+", segment) for segment in segments):
             return "segments are not all integers"
+        return None
+
+    def _guard_po_compliance_audit(self, text: str) -> str | None:
+        # Shape: a single comma-separated line of PO ids (the legal empty
+        # answer is handled by _EMPTY_ANSWER_OK before this guard runs).
+        # Bare CoT — multi-line text or prose sentences — must be rejected.
+        if "\n" in text or "\r" in text:
+            return "answer is not a single line"
+        if len(text) >= 2000:
+            return "answer is too long for a PO id list"
+        segments = text.split(",")
+        if not all(segment and re.fullmatch(r"[A-Za-z0-9_-]+", segment) for segment in segments):
+            return "segments are not all PO-id shaped"
         return None
 
     def _guard_system_issue_locator(self, text: str) -> str | None:
@@ -585,6 +681,15 @@ class ContestantAgent:
 
             messages.append(self._assistant_message_for_history(message))
             if not tool_calls:
+                if self._finish_reason(completion) == "length":
+                    # A truncated completion is never a valid final answer
+                    # (run #2 submitted a 4096-token bare CoT for 3_2).
+                    print(
+                        "model output truncated (finish_reason=length); requesting the bare answer",
+                        file=sys.stderr,
+                    )
+                    messages.append({"role": "user", "content": "输出被截断。请只输出最终答案正文，不要任何分析过程。"})
+                    continue
                 if content.strip():
                     return self._clean_final_answer(content)
                 messages.append({"role": "user", "content": "请输出最终答案文本。"})
@@ -659,6 +764,16 @@ class ContestantAgent:
             parsed = self._parse_json_object(content)
             tool_calls = self._json_prompt_tool_calls(parsed) if parsed else None
             if not tool_calls:
+                if self._finish_reason(completion) == "length":
+                    # Same truncation rule as the native loop: never accept.
+                    print(
+                        "model output truncated (finish_reason=length); requesting the bare answer",
+                        file=sys.stderr,
+                    )
+                    if content:
+                        messages.append({"role": "assistant", "content": content})
+                    messages.append({"role": "user", "content": "输出被截断。请只输出最终答案正文，不要任何分析过程。"})
+                    continue
                 if content:
                     return self._clean_final_answer(content)
                 messages.append({"role": "user", "content": "请输出最终答案文本，或输出 tool_calls JSON。"})
@@ -713,6 +828,12 @@ class ContestantAgent:
         if isinstance(tool_result, str):
             return tool_result
         return json.dumps(tool_result, ensure_ascii=False)
+
+    def _finish_reason(self, completion: dict[str, Any]) -> str:
+        choices = completion.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            return ""
+        return str(choices[0].get("finish_reason") or "")
 
     def _assistant_message_for_history(self, message: dict[str, Any]) -> dict[str, Any]:
         history_message: dict[str, Any] = {

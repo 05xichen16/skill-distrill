@@ -32,6 +32,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -39,6 +40,28 @@ DEFAULT_SALARIES = [5000, 12000, 25000, 35000, 55000, 60000, 80000, 90000, 15000
 DEFAULT_JAVA_VERSION = 'openjdk version "21.0.11"'
 
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+# Deadline self-protection: the skill runtime kills the subprocess at
+# SKILL_BUDGET_SECONDS, after which no fallback can emit. The script keeps its
+# own deadline (budget minus an emit margin) and stops expensive work in time.
+DEFAULT_BUDGET_SECONDS = 480
+EMIT_MARGIN_SECONDS = 20  # reserved for the shape fallback + stdout emit
+JAVA_ROUND_MIN_SECONDS = 90  # a repair round = model call + javac + example runs
+PY_EXTRACT_MIN_SECONDS = 30  # minimum left to be worth one extraction call
+
+
+def _remaining_seconds(deadline: Optional[float]) -> float:
+    if deadline is None:
+        return float("inf")
+    return deadline - time.monotonic()
+
+
+def _clamped_timeout(timeout: int, deadline: Optional[float]) -> int:
+    """Cap a model-call timeout by the time left before the emit deadline."""
+    remaining = _remaining_seconds(deadline)
+    if remaining == float("inf"):
+        return timeout
+    return max(5, min(timeout, int(remaining)))
 
 
 def _read_stdin_text() -> str:
@@ -158,11 +181,43 @@ def _model_config() -> Optional[Dict[str, str]]:
     return {"url": chat_url, "api_key": api_key, "model": model, "package_id": package_id}
 
 
-def _call_model(config: Dict[str, str], prompt: str, timeout: int) -> str:
-    """Text-only gateway call; the injectable seam for offline tests."""
+_RETRY_SLEEP_SECONDS = 1.5
+_GATEWAY_5XX_RE = re.compile(r"gateway HTTP (5\d{2})")
+
+
+def _is_transient_gateway_error(exc: Exception) -> bool:
+    """5xx / dropped-connection errors worth one retry (gateway blips)."""
+    import http.client
+    import urllib.error
+
+    if isinstance(exc, urllib.error.HTTPError):  # subclass of URLError: check first
+        return exc.code >= 500
+    if isinstance(exc, (http.client.RemoteDisconnected, urllib.error.URLError)):
+        return True
+    if isinstance(exc, RuntimeError):  # _post_with_http_client signals "gateway HTTP 5xx"
+        return bool(_GATEWAY_5XX_RE.search(str(exc)))
+    return False
+
+
+def _post_model_request(url: str, body: bytes, headers: Dict[str, str], timeout: int) -> str:
+    """One POST attempt; RemoteDisconnected falls through to http.client."""
     import http.client
     import urllib.request
 
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read().decode("utf-8")
+    except http.client.RemoteDisconnected:
+        return _post_with_http_client(url, body, headers, timeout)
+
+
+def _call_model(config: Dict[str, str], prompt: str, timeout: int) -> str:
+    """Text-only gateway call; the injectable seam for offline tests.
+
+    Retries once (1.5s apart) on transient gateway failures (HTTP 5xx,
+    dropped connections, URL-level errors); anything else raises through.
+    """
     payload = {
         "model": config["model"],
         "temperature": 0.0,
@@ -179,13 +234,18 @@ def _call_model(config: Dict[str, str], prompt: str, timeout: int) -> str:
         headers["package_id"] = config["package_id"]
         headers["packageId"] = config["package_id"]
 
-    request = urllib.request.Request(config["url"], data=body, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8")
-    except http.client.RemoteDisconnected:
-        raw = _post_with_http_client(config["url"], body, headers, timeout)
-    return _extract_content(raw)
+    last_error: Optional[Exception] = None
+    for attempt in range(2):
+        if attempt:
+            time.sleep(_RETRY_SLEEP_SECONDS)
+        try:
+            return _extract_content(_post_model_request(config["url"], body, headers, timeout))
+        except Exception as exc:
+            if attempt == 0 and _is_transient_gateway_error(exc):
+                last_error = exc
+                continue
+            raise
+    raise last_error  # unreachable; the second attempt either returned or raised
 
 
 def _post_with_http_client(url: str, body: bytes, headers: Dict[str, str], timeout: int) -> str:
@@ -347,6 +407,7 @@ def try_java_path(
     timeout: int,
     max_rounds: int,
     warnings: List[str],
+    deadline: Optional[float] = None,
 ) -> Optional[List[str]]:
     """Repair-compile-validate loop; returns hidden-case outputs or None."""
     if config is None:
@@ -358,7 +419,14 @@ def try_java_path(
 
     feedback = ""
     for round_index in range(1, max_rounds + 1):
-        repaired = llm_repair_source(config, source, feedback, timeout)
+        remaining = _remaining_seconds(deadline)
+        if remaining < JAVA_ROUND_MIN_SECONDS:
+            warnings.append(
+                "deadline: %.0fs left before round %d; stopping java repair"
+                % (remaining, round_index)
+            )
+            break
+        repaired = llm_repair_source(config, source, feedback, _clamped_timeout(timeout, deadline))
         if repaired is None:
             warnings.append("repair round %d: model returned no usable source" % round_index)
             feedback = "上一次输出不是可用的完整源码，请只输出完整 Java 源码。"
@@ -384,6 +452,13 @@ def try_java_path(
                 )
                 feedback = "编译成功，但示例输入输出不符：\n" + "\n".join(mismatches)
                 continue
+
+            remaining = _remaining_seconds(deadline)
+            if remaining < JAVA_ROUND_MIN_SECONDS:
+                warnings.append(
+                    "deadline: %.0fs left; skipping hidden-case runs" % remaining
+                )
+                return None
 
             outputs: List[str] = []
             for salary in salaries:
@@ -476,6 +551,7 @@ def try_python_path(
     salaries: List[int],
     timeout: int,
     warnings: List[str],
+    deadline: Optional[float] = None,
 ) -> Tuple[Optional[List[str]], Optional[Tuple[float, List[List[float]]]]]:
     """Returns (validated outputs or None, best unvalidated parameters)."""
     candidates: List[Tuple[str, Tuple[float, List[List[float]]]]] = []
@@ -484,11 +560,19 @@ def try_python_path(
     except Exception as exc:
         warnings.append("base64 parameter decode unavailable: %s" % exc)
     if config is not None:
-        extracted = llm_extract_parameters(config, source, timeout)
-        if extracted is not None:
-            candidates.append(("llm-extracted", extracted))
+        remaining = _remaining_seconds(deadline)
+        if remaining < PY_EXTRACT_MIN_SECONDS:
+            warnings.append(
+                "deadline: %.0fs left; skipping model parameter extraction" % remaining
+            )
         else:
-            warnings.append("model parameter extraction failed")
+            extracted = llm_extract_parameters(
+                config, source, _clamped_timeout(timeout, deadline)
+            )
+            if extracted is not None:
+                candidates.append(("llm-extracted", extracted))
+            else:
+                warnings.append("model parameter extraction failed")
 
     best: Optional[Tuple[float, List[List[float]]]] = candidates[0][1] if candidates else None
     for label, (deduction, brackets) in candidates:
@@ -517,14 +601,21 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
     max_rounds = _env_int("JAVA_TAX_REPAIR_ROUNDS", 3, minimum=1)
     warnings: List[str] = []
 
+    # The runtime injects SKILL_BUDGET_SECONDS = its kill timeout; finish (and
+    # emit at least the shape fallback) before it fires.
+    budget = _env_int("SKILL_BUDGET_SECONDS", DEFAULT_BUDGET_SECONDS, minimum=1)
+    deadline = time.monotonic() + budget - EMIT_MARGIN_SECONDS
+
     path = "java"
-    outputs = try_java_path(config, source, examples, salaries, timeout, max_rounds, warnings)
+    outputs = try_java_path(
+        config, source, examples, salaries, timeout, max_rounds, warnings, deadline=deadline
+    )
 
     fallback_params: Optional[Tuple[float, List[List[float]]]] = None
     if outputs is None:
         path = "python"
         outputs, fallback_params = try_python_path(
-            config, source, examples, salaries, timeout, warnings
+            config, source, examples, salaries, timeout, warnings, deadline=deadline
         )
 
     if outputs is None:

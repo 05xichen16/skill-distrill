@@ -2,7 +2,7 @@
   "name": "po_compliance_audit",
   "description": "Audit completed high-value purchase orders for vendor service-scope coverage and valid VP approval, returning non-compliant PO ids sorted ascending.",
   "entrypoint": "scripts/run.py",
-  "timeout_seconds": 60,
+  "timeout_seconds": 600,
   "input_schema": {
     "type": "object",
     "properties": {

@@ -24,9 +24,28 @@ import json
 import os
 import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
+
+
+# Deadline self-protection: the skill runtime kills the subprocess at
+# SKILL_BUDGET_SECONDS, after which no fallback can emit. The script keeps its
+# own deadline (budget minus an emit margin) and degrades model calls to the
+# code path in time.
+DEFAULT_BUDGET_SECONDS = 600
+EMIT_MARGIN_SECONDS = 15  # reserved for aggregation + stdout emit
+DEEP_AUDIT_MIN_SECONDS = 15  # minimum left to be worth one deep-audit call
+
+
+def _remaining_seconds(deadline: float) -> float:
+    return deadline - time.monotonic()
+
+
+def _clamped_timeout(timeout: int, deadline: float) -> int:
+    """Cap a model-call timeout by the time left before the emit deadline."""
+    return max(5, min(timeout, int(_remaining_seconds(deadline))))
 
 
 MONTHS = {
@@ -354,11 +373,43 @@ def _model_config() -> Optional[Dict[str, str]]:
     return {"url": chat_url, "api_key": api_key, "model": model, "package_id": package_id}
 
 
-def _call_model(config: Dict[str, str], prompt: str, timeout: int) -> str:
-    """Text-only gateway call; the injectable seam for offline tests."""
+_RETRY_SLEEP_SECONDS = 1.5
+_GATEWAY_5XX_RE = re.compile(r"gateway HTTP (5\d{2})")
+
+
+def _is_transient_gateway_error(exc: Exception) -> bool:
+    """5xx / dropped-connection errors worth one retry (gateway blips)."""
+    import http.client
+    import urllib.error
+
+    if isinstance(exc, urllib.error.HTTPError):  # subclass of URLError: check first
+        return exc.code >= 500
+    if isinstance(exc, (http.client.RemoteDisconnected, urllib.error.URLError)):
+        return True
+    if isinstance(exc, RuntimeError):  # _post_with_http_client signals "gateway HTTP 5xx"
+        return bool(_GATEWAY_5XX_RE.search(str(exc)))
+    return False
+
+
+def _post_model_request(url: str, body: bytes, headers: Dict[str, str], timeout: int) -> str:
+    """One POST attempt; RemoteDisconnected falls through to http.client."""
     import http.client
     import urllib.request
 
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read().decode("utf-8")
+    except http.client.RemoteDisconnected:
+        return _post_with_http_client(url, body, headers, timeout)
+
+
+def _call_model(config: Dict[str, str], prompt: str, timeout: int) -> str:
+    """Text-only gateway call; the injectable seam for offline tests.
+
+    Retries once (1.5s apart) on transient gateway failures (HTTP 5xx,
+    dropped connections, URL-level errors); anything else raises through.
+    """
     payload = {
         "model": config["model"],
         "temperature": 0.0,
@@ -375,15 +426,18 @@ def _call_model(config: Dict[str, str], prompt: str, timeout: int) -> str:
         headers["package_id"] = config["package_id"]
         headers["packageId"] = config["package_id"]
 
-    import urllib.request as _ur
-
-    request = _ur.Request(config["url"], data=body, headers=headers, method="POST")
-    try:
-        with _ur.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8")
-    except http.client.RemoteDisconnected:
-        raw = _post_with_http_client(config["url"], body, headers, timeout)
-    return _extract_content(raw)
+    last_error: Optional[Exception] = None
+    for attempt in range(2):
+        if attempt:
+            time.sleep(_RETRY_SLEEP_SECONDS)
+        try:
+            return _extract_content(_post_model_request(config["url"], body, headers, timeout))
+        except Exception as exc:
+            if attempt == 0 and _is_transient_gateway_error(exc):
+                last_error = exc
+                continue
+            raise
+    raise last_error  # unreachable; the second attempt either returned or raised
 
 
 def _post_with_http_client(url: str, body: bytes, headers: Dict[str, str], timeout: int) -> str:
@@ -521,6 +575,11 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
     timeout = _env_int("AGENT_DEMO_TIMEOUT_SECONDS", 60, minimum=5)
     workers = _env_int("PO_AUDIT_WORKERS", 4, minimum=1)
 
+    # The runtime injects SKILL_BUDGET_SECONDS = its kill timeout; finish (and
+    # emit a well-formed answer) before it fires.
+    budget = _env_int("SKILL_BUDGET_SECONDS", DEFAULT_BUDGET_SECONDS, minimum=1)
+    deadline = time.monotonic() + budget - EMIT_MARGIN_SECONDS
+
     threshold = parse_amount_threshold(task_description)
     if threshold is None:
         threshold = 50000
@@ -533,7 +592,9 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
         status = po.get("status", "")
         if is_terminal_status(status) is None and status.strip() and status not in unknown_words:
             unknown_words.append(status)
-    llm_status = classify_unknown_statuses(config, unknown_words, timeout, warnings)
+    llm_status = classify_unknown_statuses(
+        config, unknown_words, _clamped_timeout(timeout, deadline), warnings
+    )
 
     def status_is_terminal(status: str) -> bool:
         verdict = is_terminal_status(status)
@@ -568,16 +629,24 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
         vendor = vendors.get(po.get("vendor_id", ""))
         texts = evidence_for(po)
 
+        judged_by = "code"
         if config is not None:
-            verdict = llm_deep_audit(config, po, vendor, texts, timeout)
-            if verdict is not None:
-                scope_ok = bool(verdict.get("items_all_in_scope"))
-                approval_ok = _approval_ok_from_llm(po, verdict, roles)
-                return po_id, scope_ok and approval_ok, "llm"
+            if _remaining_seconds(deadline) < DEEP_AUDIT_MIN_SECONDS:
+                # Out of time for a model call: degrade to the code rules so
+                # the answer still emits before the runtime kill.
+                judged_by = "code-deadline"
+            else:
+                verdict = llm_deep_audit(
+                    config, po, vendor, texts, _clamped_timeout(timeout, deadline)
+                )
+                if verdict is not None:
+                    scope_ok = bool(verdict.get("items_all_in_scope"))
+                    approval_ok = _approval_ok_from_llm(po, verdict, roles)
+                    return po_id, scope_ok and approval_ok, "llm"
 
         scope_ok = bool(vendor) and service_scope_ok(po, vendor.get("service_scope", ""))
         approval_ok = has_valid_approval(po, texts, roles)
-        return po_id, scope_ok and approval_ok, "code"
+        return po_id, scope_ok and approval_ok, judged_by
 
     results: List[Optional[Tuple[str, bool, str]]] = [None] * len(deep)
     if deep:
@@ -591,12 +660,15 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
 
     bad: List[str] = []
     judged_by_code = 0
+    judged_by_deadline = 0
     for outcome in results:
         if outcome is None:
             continue
         po_id, compliant, judged_by = outcome
         if judged_by == "code":
             judged_by_code += 1
+        elif judged_by == "code-deadline":
+            judged_by_deadline += 1
         if not compliant and po_id:
             bad.append(po_id)
 
@@ -604,6 +676,8 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
         warnings.append("model gateway not configured; deep audit ran on code keyword rules only")
     elif judged_by_code:
         warnings.append("%d/%d POs judged by code fallback (model call failed)" % (judged_by_code, len(deep)))
+    if judged_by_deadline:
+        warnings.append("%d/%d POs judged by code fallback (deadline reached)" % (judged_by_deadline, len(deep)))
 
     bad = sorted(set(bad))
     return {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 import sys
 from typing import Any
@@ -77,7 +78,9 @@ class BatchRunner:
         qid = str(question.get("id", "unknown"))
         try:
             context = self._build_context(question=question, question_dir=question_dir)
+            started = time.monotonic()
             answer = await ContestantAgent().solve(question=question, context=context)
+            print(f"question {qid} done in {time.monotonic() - started:.1f}s")
             return {
                 "id": qid,
                 "answer": str(answer),

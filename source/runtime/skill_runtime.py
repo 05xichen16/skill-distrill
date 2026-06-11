@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -153,6 +154,10 @@ class SkillRuntime:
             raise FileNotFoundError(f"skill entrypoint not found: {skill.entrypoint}")
 
         stdin = json.dumps(arguments or {}, ensure_ascii=False)
+        # Tell the script its own kill budget so it can stop model/tool work
+        # early and still emit a well-formed answer before we time it out.
+        env = dict(os.environ)
+        env["SKILL_BUDGET_SECONDS"] = str(skill.timeout_seconds)
         completed = subprocess.run(
             [sys.executable, str(script_path)],
             input=stdin,
@@ -161,6 +166,7 @@ class SkillRuntime:
             cwd=str(skill.skill_dir),
             timeout=skill.timeout_seconds,
             check=False,
+            env=env,
         )
         if completed.returncode != 0:
             error = completed.stderr.strip() or completed.stdout.strip()
