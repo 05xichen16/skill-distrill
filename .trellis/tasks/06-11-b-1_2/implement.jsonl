@@ -1,0 +1,2 @@
+{"file": ".trellis/tasks/06-11-b-1_2/research/1_2-tech-context.md", "reason": "复用脚手架(prompt_learn_classify 的 _model_config/HTTP调用/_read_stdin_text/_emit/retry兜底)、match1判分锚点、已grep验证的答案在.md里的位置、规范组头→文件映射、检索策略——直接照搬少走弯路"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "先搜后写:模型调用与运行时骨架复用 prompt_learn_classify/sensitive_scan,勿重写"}

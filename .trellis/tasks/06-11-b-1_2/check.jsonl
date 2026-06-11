@@ -1,0 +1,2 @@
+{"file": ".trellis/tasks/06-11-b-1_2/research/1_2-tech-context.md", "reason": "判分锚点(match1子串语义)、已验证答案位置、通用性硬约束(禁硬编码题数/答案)——核查时对照"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "核查是否复用既有 skill 骨架而非重写"}

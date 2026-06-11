@@ -1,0 +1,21 @@
+{
+  "name": "spec_qa",
+  "description": "Spec-grounded Q&A: answer several sub-questions about a fixed set of specification documents, one-by-one, using each spec's ORIGINAL wording and language, then join the answers with ';' in question order. Generic - the number of questions, their order, their answers and which spec each targets are all derived from the inputs, never hard-coded. The spec documents are a fixed knowledge base retrieved per question.",
+  "entrypoint": "scripts/run.py",
+  "timeout_seconds": 600,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "task_description": {
+        "type": "string",
+        "description": "The question text, verbatim, including the full list of sub-questions (Q1, Q2, ...) and any group headers. The skill parses the questions, their order and their group routing from this text."
+      },
+      "spec_dir": {
+        "type": "string",
+        "description": "Name (or path) of the directory holding the specification documents declared in the question. Relative names resolve against the question directory. Optional; inferred from the question's declared directory when omitted."
+      }
+    },
+    "required": ["task_description"],
+    "additionalProperties": true
+  }
+}
