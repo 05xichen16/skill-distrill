@@ -481,15 +481,214 @@ def decode_triple(value: str) -> str:
     return text
 
 
+_STRING_LITERAL_RE = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
+_ROW_RE = re.compile(
+    r"[\[{]\s*(-?\d+(?:\.\d+)?(?:\s*,\s*-?\d+(?:\.\d+)?){2,3})\s*[\]}]"
+)
+
+
+def _decode_string_literal(value: str) -> str:
+    try:
+        return bytes(value, "utf-8").decode("unicode_escape")
+    except UnicodeDecodeError:
+        return value
+
+
+def _decode_base64_chain(value: str, max_rounds: int = 5) -> List[str]:
+    """Return every printable decode in a repeated base64 chain."""
+    outputs: List[str] = []
+    current = value.strip()
+    for _ in range(max_rounds):
+        compact = re.sub(r"\s+", "", current)
+        if not compact or len(compact) < 4:
+            break
+        padded = compact + ("=" * ((4 - len(compact) % 4) % 4))
+        try:
+            raw = base64.b64decode(padded, validate=True)
+            decoded = raw.decode("utf-8").strip()
+        except Exception:
+            break
+        if not decoded or decoded == current:
+            break
+        outputs.append(decoded)
+        current = decoded
+    return outputs
+
+
+def _candidate_texts_from_source(source: str) -> List[Tuple[str, str]]:
+    """Source text plus decoded string constants, tagged by nearby context."""
+    candidates: List[Tuple[str, str]] = [("source", source)]
+    for match in _STRING_LITERAL_RE.finditer(source):
+        literal = _decode_string_literal(match.group(1))
+        context = source[max(0, match.start() - 120):match.start()].lower()
+        for decoded in _decode_base64_chain(literal):
+            candidates.append((context, decoded))
+    return candidates
+
+
+def _numeric_rows(text: str) -> List[List[float]]:
+    rows: List[List[float]] = []
+    for match in _ROW_RE.finditer(text):
+        values = [float(item) for item in _NUMBER_RE.findall(match.group(1))]
+        if 3 <= len(values) <= 4:
+            rows.append(values)
+    return rows
+
+
+def _normalise_rate(rate: float) -> float:
+    return rate / 100.0 if rate > 1.0 else rate
+
+
+def _clean_brackets(rows: List[List[float]]) -> List[List[List[float]]]:
+    """Build plausible [lower, upper, rate, quick] tables from numeric rows."""
+    variants: List[List[List[float]]] = []
+    if len(rows) < 2:
+        return variants
+
+    if all(len(row) >= 4 for row in rows):
+        layouts = ((0, 1, 2, 3), (1, 0, 2, 3), (0, 1, 3, 2))
+        for lower_i, upper_i, rate_i, quick_i in layouts:
+            table: List[List[float]] = []
+            for row in rows:
+                lower = row[lower_i]
+                upper = row[upper_i]
+                rate = _normalise_rate(row[rate_i])
+                quick = row[quick_i]
+                if lower > upper:
+                    lower, upper = upper, lower
+                table.append([lower, upper, rate, quick])
+            if _valid_brackets(table):
+                variants.append(table)
+
+    if all(len(row) >= 3 for row in rows):
+        # Common compact table: [upper, rate, quick]. Infer lower from the
+        # previous upper bound. This is intentionally a fallback and is
+        # validated against worked examples before use.
+        table = []
+        lower = 0.0
+        for row in rows:
+            upper = row[0]
+            table.append([lower, upper, _normalise_rate(row[1]), row[2]])
+            lower = upper + 1.0
+        if _valid_brackets(table):
+            variants.append(table)
+
+    unique: List[List[List[float]]] = []
+    seen = set()
+    for table in variants:
+        key = tuple(tuple(round(value, 8) for value in row) for row in table)
+        if key not in seen:
+            seen.add(key)
+            unique.append(table)
+    return unique
+
+
+def _valid_brackets(table: List[List[float]]) -> bool:
+    if not table:
+        return False
+    for lower, upper, rate, _quick in table:
+        if lower > upper or rate < 0 or rate > 1:
+            return False
+    return True
+
+
+def _deduction_candidates_from_texts(texts: List[Tuple[str, str]]) -> List[float]:
+    candidates: List[float] = []
+    for context, text in texts:
+        lowered = (context + "\n" + text[:200]).lower()
+        numbers = [float(item) for item in _NUMBER_RE.findall(text)]
+        if len(numbers) == 1 and any(
+            token in lowered
+            for token in ("deduction", "threshold", "exemption", "allowance", "point")
+        ):
+            candidates.append(numbers[0])
+
+        for pattern in (
+            r"(?:deduction|threshold|exemption|allowance|point)[A-Za-z0-9_\s:=\-]*([0-9]+(?:\.\d+)?)",
+            r"(?:起征点|免征额|扣除)[^0-9]{0,30}([0-9]+(?:\.\d+)?)",
+        ):
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                candidates.append(float(match.group(1)))
+
+    # Sensible personal-income-tax defaults are cheap candidates; examples
+    # decide whether any of them are acceptable.
+    candidates.extend([0.0, 3500.0, 5000.0, 6000.0])
+    return _unique_numbers(candidates)
+
+
+def _deductions_from_examples(
+    brackets: List[List[float]], examples: List[Tuple[int, str]]
+) -> List[float]:
+    candidates: List[float] = []
+    for salary, expected_text in examples:
+        try:
+            expected = float(expected_text)
+        except ValueError:
+            continue
+        if expected <= 0:
+            continue
+        for lower, upper, rate, quick in brackets:
+            if rate <= 0:
+                continue
+            taxable = (expected + quick) / rate
+            if lower - 0.01 <= taxable <= upper + 0.01:
+                candidates.append(float(salary) - taxable)
+    return _unique_numbers(candidates)
+
+
+def _unique_numbers(values: List[float]) -> List[float]:
+    result: List[float] = []
+    seen = set()
+    for value in values:
+        rounded = round(value, 6)
+        if rounded in seen:
+            continue
+        seen.add(rounded)
+        result.append(value)
+    return result
+
+
+def extract_parameter_candidates(
+    source: str, examples: List[Tuple[int, str]]
+) -> List[Tuple[float, List[List[float]]]]:
+    texts = _candidate_texts_from_source(source)
+    bracket_tables: List[List[List[float]]] = []
+    for _context, text in texts:
+        rows = _numeric_rows(text)
+        if rows:
+            bracket_tables.extend(_clean_brackets(rows))
+
+    unique_tables: List[List[List[float]]] = []
+    seen_tables = set()
+    for table in bracket_tables:
+        key = tuple(tuple(round(value, 8) for value in row) for row in table)
+        if key in seen_tables:
+            continue
+        seen_tables.add(key)
+        unique_tables.append(table)
+
+    base_deductions = _deduction_candidates_from_texts(texts)
+    candidates: List[Tuple[float, List[List[float]]]] = []
+    for table in unique_tables:
+        deductions = base_deductions + _deductions_from_examples(table, examples)
+        for deduction in _unique_numbers(deductions):
+            candidates.append((deduction, table))
+    return candidates
+
+
 def decode_parameters(source: str) -> Tuple[float, List[List[float]]]:
-    """Public-set shape: triple-base64 constants. Raises when absent."""
+    """Extract tax parameters from encoded constants or inline tables."""
     tax_match = re.search(r"TAX_BRACKETS_ENCODED\s*=\s*\"([^\"]+)\"", source)
     deduction_match = re.search(r"DEDUCTION_POINT_ENCODED\s*=\s*\"([^\"]+)\"", source)
-    if not tax_match or not deduction_match:
-        raise ValueError("encoded tax parameters not found")
-    deduction = float(decode_triple(deduction_match.group(1)))
-    brackets = json.loads(decode_triple(tax_match.group(1)))
-    return deduction, [[float(item) for item in row] for row in brackets]
+    if tax_match and deduction_match:
+        deduction = float(decode_triple(deduction_match.group(1)))
+        brackets = json.loads(decode_triple(tax_match.group(1)))
+        return deduction, [[float(item) for item in row] for row in brackets]
+
+    candidates = extract_parameter_candidates(source, [])
+    if candidates:
+        return candidates[0]
+    raise ValueError("tax parameters not found")
 
 
 _EXTRACT_PROMPT = """下面是一份 Java 个人所得税计算器源码（含注释）。请从源码与注释中提取计税参数：
@@ -577,6 +776,21 @@ def try_python_path(
             return outputs, decoded
     except Exception as exc:
         warnings.append("base64 parameter decode unavailable: %s" % exc)
+
+    source_candidates = extract_parameter_candidates(source, examples)
+    matched_source_candidate = False
+    for candidate in source_candidates:
+        if best is None:
+            best = candidate
+        deduction, brackets = candidate
+        if not examples or _examples_match(deduction, brackets, examples):
+            matched_source_candidate = True
+            return ["%.2f" % calculate_tax(s, deduction, brackets) for s in salaries], candidate
+    if source_candidates and not matched_source_candidate:
+        warnings.append(
+            "%d source-extracted parameter candidate(s) did not reproduce the worked examples"
+            % len(source_candidates)
+        )
 
     if config is not None:
         remaining = _remaining_seconds(deadline)

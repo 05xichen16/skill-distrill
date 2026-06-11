@@ -10,6 +10,7 @@ Standard-library unittest.
 """
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import os
@@ -126,6 +127,64 @@ class PublicDecodePathTest(unittest.TestCase):
         )
         self.assertIsNotNone(outputs)
         self.assertEqual(outputs, [_expected_tax(s) for s in salaries])
+
+
+class GenericParameterExtractionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    def _triple(self, text: str) -> str:
+        raw = text.encode("utf-8")
+        for _ in range(3):
+            raw = base64.b64encode(raw)
+        return raw.decode("ascii")
+
+    def test_renamed_base64_constants_validate(self) -> None:
+        source = """
+public class TaxVariant {
+  static final String BRACKET_PAYLOAD = "%s";
+  static final String TAX_FREE_POINT = "%s";
+}
+""" % (
+            self._triple(json.dumps(BRACKETS)),
+            self._triple(str(int(DEDUCTION))),
+        )
+        warnings: list = []
+        outputs, _ = self.module.try_python_path(
+            None,
+            source,
+            self.module.parse_examples(TASK_TEXT),
+            self.module.hidden_salaries(TASK_TEXT),
+            30,
+            warnings,
+        )
+        self.assertEqual(outputs, [_expected_tax(s) for s in self.module.hidden_salaries(TASK_TEXT)])
+
+    def test_inline_percent_rate_table_validate(self) -> None:
+        source = """
+public class TaxVariant {
+  static final int DEDUCTION_POINT = 5000;
+  static final double[][] TAX_TABLE = {
+    {0, 3000, 3, 0},
+    {3001, 12000, 10, 410},
+    {12001, 25000, 20, 2660},
+    {25001, 35000, 25, 4410},
+    {35001, 55000, 30, 7160},
+    {55001, 80000, 35, 15160},
+    {80001, 999999999, 45, 15310}
+  };
+}
+"""
+        warnings: list = []
+        outputs, _ = self.module.try_python_path(
+            None,
+            source,
+            self.module.parse_examples(TASK_TEXT),
+            self.module.hidden_salaries(TASK_TEXT),
+            30,
+            warnings,
+        )
+        self.assertEqual(outputs, [_expected_tax(s) for s in self.module.hidden_salaries(TASK_TEXT)])
 
 
 class JavaPathTest(unittest.TestCase):

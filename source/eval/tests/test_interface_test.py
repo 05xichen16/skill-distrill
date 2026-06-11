@@ -224,7 +224,80 @@ class StepParsingHelpersTest(unittest.TestCase):
         self.assertEqual(MOD._extract_json_array(text), [{"a": 1}])
 
 
+class DeterministicInferenceTest(unittest.TestCase):
+    def test_update_then_detail_steps(self) -> None:
+        case = {
+            "id": "T1",
+            "description": "获取 token，更新用户 U1003 的邮箱为 u@example.com、职级为 Senior，然后查询 U1003 详情。",
+            "assert": {
+                "expectedValues": {
+                    "data.userId": "U1003",
+                    "data.email": "u@example.com",
+                    "data.title": "Senior",
+                }
+            },
+        }
+        steps = MOD.infer_steps_from_case(case, PUBLIC_API_DOC, MOD.build_auth(AUTH_CONFIG))
+        self.assertEqual(len(steps), 2)
+        self.assertEqual(steps[0]["method"], "POST")
+        self.assertTrue(steps[0]["write"])
+        self.assertEqual(steps[0]["body"], {"userId": "U1003", "email": "u@example.com", "title": "Senior"})
+        self.assertFalse(steps[0]["assert"])
+        self.assertEqual(steps[1]["method"], "GET")
+        self.assertEqual(steps[1]["path"], "/api/user/detail/U1003")
+        self.assertTrue(steps[1]["assert"])
+
+    def test_verbose_detail_for_manager_assertion(self) -> None:
+        case = {
+            "id": "T2",
+            "description": "查询用户 U1010 的详细信息，携带 verbose=true；校验经理信息。",
+            "assert": {
+                "expectedFields": ["data.userId", "data.manager.userId"],
+                "expectedValues": {"data.userId": "U1010"},
+            },
+        }
+        steps = MOD.infer_steps_from_case(case, PUBLIC_API_DOC, MOD.build_auth(AUTH_CONFIG))
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["path"], "/api/user/detail/U1010")
+        self.assertEqual(steps[0]["query"], {"verbose": True})
+
+    def test_search_query_from_description(self) -> None:
+        case = {
+            "id": "T3",
+            "description": "按 status=active、page=1、pageSize=5、sortOrder=desc 查询用户列表。",
+            "assert": {"expectedFields": ["data.page", "data.list.0.userId"]},
+        }
+        steps = MOD.infer_steps_from_case(case, PUBLIC_API_DOC, MOD.build_auth(AUTH_CONFIG))
+        self.assertEqual(steps[0]["path"], "/api/user/search")
+        self.assertEqual(steps[0]["query"]["status"], "active")
+        self.assertEqual(steps[0]["query"]["page"], 1)
+        self.assertEqual(steps[0]["query"]["pageSize"], 5)
+        self.assertEqual(steps[0]["query"]["sortOrder"], "desc")
+
+
 # --- a fake in-memory service (the http_request seam) -----------------------
+
+PUBLIC_API_DOC = """
+### 查询用户详情
+- 路径：`/api/user/detail/{userId}`
+- 方法：`GET`
+
+### 分页查询用户列表
+- 路径：`/api/user/search`
+- 方法：`GET`
+
+### 更新用户信息
+- 路径：`/api/user/update`
+- 方法：`POST`
+
+### 批量更新用户状态
+- 路径：`/api/user/batch-update-status`
+- 方法：`POST`
+
+### 查询部门活跃用户统计
+- 路径：`/api/user/stat/active`
+- 方法：`GET`
+"""
 
 class FakeService:
     """A tiny stateful stand-in for the real interface service.
@@ -471,9 +544,10 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(result["answer"], "")  # C5 passes (write took effect)
         self.assertTrue(any(c["path"] == "/api/auth/token" for c in svc.calls))
 
-    def test_no_config_reports_nothing_failing(self) -> None:
-        # No MODEL_* env -> cases cannot be judged -> empty answer, no crash, no
-        # over-reporting (which would shift positions and hurt the ratio score).
+    def test_no_config_uses_deterministic_inference_when_possible(self) -> None:
+        # No MODEL_* env no longer means "all cases unjudged": cases whose
+        # assertion/description can be mapped deterministically are still
+        # executed. Model-only cases remain conservative.
         with tempfile.TemporaryDirectory() as tmp:
             doc_dir = _write_inputs(Path(tmp), CASES)
             svc = FakeService()
@@ -483,8 +557,9 @@ class EndToEndTest(unittest.TestCase):
                 "_runtime": {"question_dir": str(doc_dir.parent)},
             }
             result = MOD.answer(args, parser=_fake_parser(STEPS_BY_ID), requester=svc)
-        self.assertEqual(result["answer"], "")
-        self.assertEqual(result["failed"], [])
+        self.assertEqual(result["answer"], "C2,C4")
+        self.assertEqual(result["failed"], ["C2", "C4"])
+        self.assertEqual(result["unjudged"], 2)  # C3/C5 need the model seam in this synthetic fixture.
         self.assertTrue(any("not configured" in w for w in result["warnings"]))
 
     def test_parse_failure_is_conservative_pass(self) -> None:
@@ -492,12 +567,12 @@ class EndToEndTest(unittest.TestCase):
         # failing (a false positive would shift every later position). With
         # 1/3 unjudgeable the answer stays conservative.
         with tempfile.TemporaryDirectory() as tmp:
-            doc_dir = _write_inputs(Path(tmp), [CASES[0], CASES[1], CASES[2]])  # C1, C2(fail), C3
+            doc_dir = _write_inputs(Path(tmp), [CASES[4], CASES[1], CASES[2]])  # C5(model), C2(fail), C3
             _set_fake_config()
             os.environ["INTERFACE_TEST_RETRIES"] = "1"
             svc = FakeService()
             steps = dict(STEPS_BY_ID)
-            steps["case C1"] = RuntimeError("model down")  # C1 cannot be parsed
+            steps["case C5"] = RuntimeError("model down")  # C5 cannot be parsed
             args = {
                 "task_description": "verify",
                 "doc_dir": str(doc_dir),
