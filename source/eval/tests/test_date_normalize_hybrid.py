@@ -76,7 +76,7 @@ class DateNormalizeHybridTest(unittest.TestCase):
         self.assertEqual(result["sources"], ["regex"])
         self.assertEqual(calls, [])
 
-    def test_relative_line_goes_llm(self) -> None:
+    def test_relative_line_uses_regex_when_solved(self) -> None:
         config = {"url": "u", "api_key": "k", "model": "m", "package_id": ""}
         result, calls = self._answer(
             ["今天是2026年5月6日，下周一能到吗？"],
@@ -84,8 +84,8 @@ class DateNormalizeHybridTest(unittest.TestCase):
             model_responses=["2026-05-11"],
         )
         self.assertEqual(result["answer"], "2026-05-11")
-        self.assertEqual(result["sources"], ["llm"])
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(result["sources"], ["regex"])
+        self.assertEqual(calls, [])
 
     def test_llm_failure_falls_back_to_regex_value(self) -> None:
         config = {"url": "u", "api_key": "k", "model": "m", "package_id": ""}
@@ -96,12 +96,12 @@ class DateNormalizeHybridTest(unittest.TestCase):
             model_responses=[RuntimeError("boom"), RuntimeError("boom")],
         )
         self.assertEqual(result["answer"], "2026-05-07")
-        self.assertEqual(result["sources"], ["regex-fallback"])
+        self.assertEqual(result["sources"], ["regex"])
 
-    def test_llm_garbage_retried_then_fallback(self) -> None:
+    def test_llm_only_when_regex_fails(self) -> None:
         config = {"url": "u", "api_key": "k", "model": "m", "package_id": ""}
         result, calls = self._answer(
-            ["今天是2026年5月6日，明天发货。"],
+            ["用户只说帮我约到发布日，材料里没有直接日期。"],
             config=config,
             model_responses=["我无法确定", "2026-05-07 是答案"],
         )

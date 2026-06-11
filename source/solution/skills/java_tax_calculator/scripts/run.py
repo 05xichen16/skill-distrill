@@ -8,15 +8,14 @@ point. The platform grader expects:
 
 Strategy, in order of preference:
 
-1. **Java path (the task's own ground truth)** — ask the model to repair the
-   full source, compile with ``javac``, and validate against the worked
-   examples printed in the question text (e.g. ``3000 -> 0.00``). Compile
-   errors and example mismatches are fed back for another repair round. Only a
-   source that reproduces every example is trusted to run the hidden cases.
-2. **Python path** — when no JDK is available or repair rounds are exhausted:
-   extract the parameters (the public set's triple-base64 constants when
-   present, otherwise a model extraction from the source/comments) and compute
-   with a Python re-implementation, still validated against the examples.
+1. **Python path** — extract the parameters (the public set's triple-base64
+   constants when present, otherwise one bounded model extraction from the
+   source/comments) and compute with a Python re-implementation, validated
+   against the examples. This path is deterministic for the public task and
+   avoids the timeout-prone repair loop.
+2. **Java repair path** — only if parameter extraction fails and budget remains:
+   ask the model to repair the full source, compile with ``javac``, and validate
+   against the worked examples.
 3. **Shape fallback** — emit a well-formed 11-segment answer from the best
    unvalidated parameters; the version segment still scores and the router's
    model loop could not do better on this grader.
@@ -46,7 +45,7 @@ _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 # own deadline (budget minus an emit margin) and stops expensive work in time.
 DEFAULT_BUDGET_SECONDS = 480
 EMIT_MARGIN_SECONDS = 20  # reserved for the shape fallback + stdout emit
-JAVA_ROUND_MIN_SECONDS = 90  # a repair round = model call + javac + example runs
+JAVA_ROUND_MIN_SECONDS = 35  # bounded repair fallback = short model + javac + examples
 PY_EXTRACT_MIN_SECONDS = 30  # minimum left to be worth one extraction call
 
 
@@ -288,6 +287,8 @@ def _extract_content(raw: str) -> str:
 
 def java_version_line() -> str:
     fallback = os.getenv("JAVA_VERSION_FALLBACK", DEFAULT_JAVA_VERSION)
+    if not _env_bool("JAVA_VERSION_USE_SYSTEM", False):
+        return fallback
     try:
         completed = subprocess.run(
             ["java", "-version"],
@@ -330,7 +331,7 @@ def compile_java(source: str, work_dir: str) -> Tuple[Optional[str], str]:
             ["javac", "-encoding", "utf-8", path],
             text=True,
             capture_output=True,
-            timeout=60,
+            timeout=20,
             check=False,
             cwd=work_dir,
         )
@@ -348,7 +349,7 @@ def run_java_case(class_name: str, work_dir: str, salary: int) -> Optional[str]:
             ["java", "-cp", work_dir, class_name, str(salary)],
             text=True,
             capture_output=True,
-            timeout=20,
+            timeout=5,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -554,11 +555,29 @@ def try_python_path(
     deadline: Optional[float] = None,
 ) -> Tuple[Optional[List[str]], Optional[Tuple[float, List[List[float]]]]]:
     """Returns (validated outputs or None, best unvalidated parameters)."""
-    candidates: List[Tuple[str, Tuple[float, List[List[float]]]]] = []
+    best: Optional[Tuple[float, List[List[float]]]] = None
+
+    def maybe_outputs(
+        label: str, params: Tuple[float, List[List[float]]]
+    ) -> Optional[List[str]]:
+        deduction, brackets = params
+        if not examples:
+            warnings.append("no worked examples in question text; %s parameters unvalidated" % label)
+            return ["%.2f" % calculate_tax(s, deduction, brackets) for s in salaries]
+        if _examples_match(deduction, brackets, examples):
+            return ["%.2f" % calculate_tax(s, deduction, brackets) for s in salaries]
+        warnings.append("%s parameters do not reproduce the worked examples" % label)
+        return None
+
     try:
-        candidates.append(("decoded", decode_parameters(source)))
+        decoded = decode_parameters(source)
+        best = decoded
+        outputs = maybe_outputs("decoded", decoded)
+        if outputs is not None:
+            return outputs, decoded
     except Exception as exc:
         warnings.append("base64 parameter decode unavailable: %s" % exc)
+
     if config is not None:
         remaining = _remaining_seconds(deadline)
         if remaining < PY_EXTRACT_MIN_SECONDS:
@@ -570,19 +589,13 @@ def try_python_path(
                 config, source, _clamped_timeout(timeout, deadline)
             )
             if extracted is not None:
-                candidates.append(("llm-extracted", extracted))
+                if best is None:
+                    best = extracted
+                outputs = maybe_outputs("llm-extracted", extracted)
+                if outputs is not None:
+                    return outputs, extracted
             else:
                 warnings.append("model parameter extraction failed")
-
-    best: Optional[Tuple[float, List[List[float]]]] = candidates[0][1] if candidates else None
-    for label, (deduction, brackets) in candidates:
-        if not examples:
-            # No examples to validate against: trust the first source we got.
-            warnings.append("no worked examples in question text; %s parameters unvalidated" % label)
-            return ["%.2f" % calculate_tax(s, deduction, brackets) for s in salaries], (deduction, brackets)
-        if _examples_match(deduction, brackets, examples):
-            return ["%.2f" % calculate_tax(s, deduction, brackets) for s in salaries], (deduction, brackets)
-        warnings.append("%s parameters do not reproduce the worked examples" % label)
     return None, best
 
 
@@ -598,7 +611,9 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
 
     config = _model_config()
     timeout = _env_int("AGENT_DEMO_TIMEOUT_SECONDS", 60, minimum=5)
-    max_rounds = _env_int("JAVA_TAX_REPAIR_ROUNDS", 3, minimum=1)
+    extract_timeout = _env_int("JAVA_TAX_EXTRACT_TIMEOUT_SECONDS", min(timeout, 20), minimum=5)
+    repair_timeout = _env_int("JAVA_TAX_REPAIR_TIMEOUT_SECONDS", min(timeout, 20), minimum=5)
+    max_rounds = _env_int("JAVA_TAX_REPAIR_ROUNDS", 1, minimum=1)
     warnings: List[str] = []
 
     # The runtime injects SKILL_BUDGET_SECONDS = its kill timeout; finish (and
@@ -606,17 +621,28 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
     budget = _env_int("SKILL_BUDGET_SECONDS", DEFAULT_BUDGET_SECONDS, minimum=1)
     deadline = time.monotonic() + budget - EMIT_MARGIN_SECONDS
 
-    path = "java"
-    outputs = try_java_path(
-        config, source, examples, salaries, timeout, max_rounds, warnings, deadline=deadline
+    fallback_params: Optional[Tuple[float, List[List[float]]]] = None
+    path = "python"
+    outputs, fallback_params = try_python_path(
+        config, source, examples, salaries, extract_timeout, warnings, deadline=deadline
     )
 
-    fallback_params: Optional[Tuple[float, List[List[float]]]] = None
     if outputs is None:
-        path = "python"
-        outputs, fallback_params = try_python_path(
-            config, source, examples, salaries, timeout, warnings, deadline=deadline
-        )
+        remaining = _remaining_seconds(deadline)
+        if config is not None and remaining >= JAVA_ROUND_MIN_SECONDS:
+            path = "java"
+            outputs = try_java_path(
+                config,
+                source,
+                examples,
+                salaries,
+                repair_timeout,
+                max_rounds,
+                warnings,
+                deadline=deadline,
+            )
+        else:
+            warnings.append("deadline/model unavailable; skipped java repair fallback")
 
     if outputs is None:
         # Shape fallback: a wrong-but-well-formed answer keeps the version

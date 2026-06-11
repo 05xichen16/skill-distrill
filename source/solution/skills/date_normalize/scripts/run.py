@@ -401,14 +401,14 @@ def _llm_line_date(config: Dict[str, str], line: str, timeout: int, retries: int
 
 def solve_line_hybrid(line: str, config: Optional[Dict[str, str]], timeout: int, retries: int) -> Tuple[Optional[str], str]:
     """Solve one line; return (iso_date_or_None, source) where source is
-    'regex' | 'llm' | 'regex-fallback' | 'failed'."""
+    'regex' | 'llm' | 'failed'."""
     regex_value: Optional[str] = None
     try:
         regex_value = solve_line(line).isoformat()
     except Exception:
         regex_value = None
 
-    if not needs_reasoning(line) and regex_value is not None:
+    if regex_value is not None:
         return regex_value, "regex"
 
     if config is not None:
@@ -416,8 +416,6 @@ def solve_line_hybrid(line: str, config: Optional[Dict[str, str]], timeout: int,
         if llm_value is not None:
             return llm_value, "llm"
 
-    if regex_value is not None:
-        return regex_value, "regex-fallback"
     return None, "failed"
 
 

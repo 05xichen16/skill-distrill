@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
@@ -34,9 +35,9 @@ from typing import Any, Dict, List, Optional, Tuple
 # SKILL_BUDGET_SECONDS, after which no fallback can emit. The script keeps its
 # own deadline (budget minus an emit margin) and degrades model calls to the
 # code path in time.
-DEFAULT_BUDGET_SECONDS = 600
+DEFAULT_BUDGET_SECONDS = 60
 EMIT_MARGIN_SECONDS = 15  # reserved for aggregation + stdout emit
-DEEP_AUDIT_MIN_SECONDS = 15  # minimum left to be worth one deep-audit call
+DEEP_AUDIT_MIN_SECONDS = 10  # minimum left to be worth one rescue call
 
 
 def _remaining_seconds(deadline: float) -> float:
@@ -572,8 +573,11 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
 
     warnings: List[str] = []
     config = _model_config()
-    timeout = _env_int("AGENT_DEMO_TIMEOUT_SECONDS", 60, minimum=5)
-    workers = _env_int("PO_AUDIT_WORKERS", 4, minimum=1)
+    gateway_timeout = _env_int("AGENT_DEMO_TIMEOUT_SECONDS", 60, minimum=5)
+    timeout = _env_int("PO_AUDIT_MODEL_TIMEOUT_SECONDS", min(gateway_timeout, 8), minimum=3)
+    workers = _env_int("PO_AUDIT_WORKERS", 1, minimum=1)
+    llm_rescue_left = [_env_int("PO_AUDIT_LLM_MAX_PO", 4, minimum=0)]
+    llm_rescue_lock = threading.Lock()
 
     # The runtime injects SKILL_BUDGET_SECONDS = its kill timeout; finish (and
     # emit a well-formed answer) before it fires.
@@ -629,23 +633,31 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
         vendor = vendors.get(po.get("vendor_id", ""))
         texts = evidence_for(po)
 
+        scope_ok = bool(vendor) and service_scope_ok(po, vendor.get("service_scope", ""))
+        approval_ok = has_valid_approval(po, texts, roles)
+        if scope_ok and approval_ok:
+            return po_id, True, "code"
+
         judged_by = "code"
-        if config is not None:
+        should_try_rescue = bool(vendor) and bool(texts) and (not scope_ok or not approval_ok)
+        if config is not None and should_try_rescue:
             if _remaining_seconds(deadline) < DEEP_AUDIT_MIN_SECONDS:
                 # Out of time for a model call: degrade to the code rules so
                 # the answer still emits before the runtime kill.
                 judged_by = "code-deadline"
             else:
+                with llm_rescue_lock:
+                    if llm_rescue_left[0] <= 0:
+                        return po_id, False, "code"
+                    llm_rescue_left[0] -= 1
                 verdict = llm_deep_audit(
                     config, po, vendor, texts, _clamped_timeout(timeout, deadline)
                 )
                 if verdict is not None:
                     scope_ok = bool(verdict.get("items_all_in_scope"))
                     approval_ok = _approval_ok_from_llm(po, verdict, roles)
-                    return po_id, scope_ok and approval_ok, "llm"
+                    return po_id, scope_ok and approval_ok, "llm-rescue"
 
-        scope_ok = bool(vendor) and service_scope_ok(po, vendor.get("service_scope", ""))
-        approval_ok = has_valid_approval(po, texts, roles)
         return po_id, scope_ok and approval_ok, judged_by
 
     results: List[Optional[Tuple[str, bool, str]]] = [None] * len(deep)
