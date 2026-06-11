@@ -138,3 +138,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: 补 interface_test(1_4)+wiki_dialog(3_3) skill,端到端实测+6.33/7
+
+**Date**: 2026-06-11
+**Task**: 补 interface_test(1_4)+wiki_dialog(3_3) skill,端到端实测+6.33/7
+**Branch**: `develop`
+
+### Summary
+
+1_4/3_3 此前无skill白丢7分。新增两个通用纯标准库自动发现零硬编码skill:interface_test(1_4,LLM解析description→结构化HTTP步骤+代码断言+串行+每写步骤取新token+整轮固定X-Package-Id+失败ID代码join)、wiki_dialog(3_3,预加载权威候选池[DB带message_actions标注消息+wiki带service_action_key的FAQ]+LLM只选候选索引不生成文本+reply/action代码取原文+persona代码拼+key_map+DB标注源优先)。DashScope 35B-A3B端到端实测:1_4=2.0/2(6/6)、3_3=4.333/5(26/30),投影19.35→~25.7/32。102离线单测全绿+回归台exit0。模型本session换成Qwen3.5-35B-A3B(已记忆)。研究落盘research/(服务契约+30答案反向追溯)。3_3余4/30=选错候选可再调。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8d254f1` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
