@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -77,14 +78,26 @@ class ContestantAgent:
             return await self._direct_answer(user_content, enable_thinking=enable_thinking)
 
     def _should_enable_thinking(self, question: dict[str, Any]) -> bool:
-        """Routing hook for the thinking/token trade-off.
+        """Routing hook for the thinking/token-and-latency trade-off.
 
-        Phase A keeps thinking on for correctness (token is only a tiebreaker).
-        Phase B can branch here per question type/level to win the token
-        tiebreak without risking correctness.
+        Default OFF: thinking roughly 10x's per-call latency, and the 1-hour run
+        cap (任务书) makes that the dominant cost — with it on, the serial run
+        only reached ~4 of 10 questions. Known questions score equal-or-better
+        off (3_1 85% vs 75%; 2_2/1_2 already off).
+
+        Route a specific question back ON — without any code change — by listing
+        its id in AGENT_DEMO_THINKING_QUESTION_IDS (comma-separated). This only
+        flips the main agent loop; skills keep reading AGENT_DEMO_ENABLE_THINKING
+        directly, so their heavy per-item loops stay fast.
         """
 
-        return env_bool("AGENT_DEMO_ENABLE_THINKING", True)
+        base = env_bool("AGENT_DEMO_ENABLE_THINKING", False)
+        raw_ids = os.getenv("AGENT_DEMO_THINKING_QUESTION_IDS", "")
+        if raw_ids.strip():
+            on_ids = {part.strip() for part in raw_ids.split(",") if part.strip()}
+            if str(question.get("id", "")) in on_ids:
+                return True
+        return base
 
     def _iter_image_files(self, context: AgentContext):
         # Only directly-declared image files are auto-injected. A declared

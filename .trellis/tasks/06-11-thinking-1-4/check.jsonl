@@ -1,0 +1,3 @@
+{"file": ".trellis/tasks/06-11-thinking-1-4/research/root-cause.md", "reason": "验收对照：thinking 全局关 + 按题路由白名单的预期行为"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "钩子改动的质量门槛"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "env 解析/默认值的健壮性约束"}

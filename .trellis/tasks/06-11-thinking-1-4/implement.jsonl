@@ -1,0 +1,2 @@
+{"file": ".trellis/tasks/06-11-thinking-1-4/research/root-cause.md", "reason": "根因定位与冒烟枪：.env thinking=1 被 skill 子进程继承 + 100 次串行调用；含决策与精确行号"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "_should_enable_thinking 路由钩子的代码风格/可读性约束"}
