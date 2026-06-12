@@ -238,3 +238,37 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 8: 平台 run6 塌方诊断与三题变种修复(2_1/1_3/1_4)
+
+**Date**: 2026-06-12
+**Task**: 平台 run6 塌方诊断与三题变种修复(2_1/1_3/1_4)
+**Branch**: `develop`
+
+### Summary
+
+平台第6次跑分 38.32(-14.4) 诊断: 先判网关风暴,后经平台日志修正为'附件内部形状硬编码→变种崩→model loop 兜底'三连爆。修复并提交: 2_1 附件CSV按表头内容发现(改名/改列名变种PASS); 1_3 根因映射四层兜底(组合匹配→宽松→LLM⊆候选集→raise); 1_4 依主办方情报(变种IP/端口会变,auth_config.baseUrl唯一权威)做四级提取+TCP fail-fast+catalog<3回退raw-path+deadline自保。293 tests 全绿,公开集字节级零回归。遗留: 3_3 lexical-fallback 门禁、2_3 三雷、CONCURRENCY 网关闸、2_2/2_3 平台日志未捞。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `a2e59cb` | (see git log) |
+| `4b0144c` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
