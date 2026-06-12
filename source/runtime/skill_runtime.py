@@ -158,16 +158,33 @@ class SkillRuntime:
         # early and still emit a well-formed answer before we time it out.
         env = dict(os.environ)
         env["SKILL_BUDGET_SECONDS"] = str(skill.timeout_seconds)
-        completed = subprocess.run(
-            [sys.executable, str(script_path)],
-            input=stdin,
-            text=True,
-            capture_output=True,
-            cwd=str(skill.skill_dir),
-            timeout=skill.timeout_seconds,
-            check=False,
-            env=env,
-        )
+        try:
+            completed = subprocess.run(
+                [sys.executable, str(script_path)],
+                input=stdin,
+                text=True,
+                capture_output=True,
+                cwd=str(skill.skill_dir),
+                timeout=skill.timeout_seconds,
+                check=False,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # The kill races the skill's own deadline self-protection. If the
+            # skill managed to flush a well-formed answer just before we killed
+            # it, salvage that line instead of dropping stdout: a dropped answer
+            # forces the version-less model loop, which scores zero on
+            # position-sensitive graders. Only a genuinely empty/garbled buffer
+            # is treated as a true failure.
+            salvaged = exc.stdout
+            if isinstance(salvaged, bytes):
+                salvaged = salvaged.decode("utf-8", errors="replace")
+            salvaged = (salvaged or "").strip()
+            if _has_usable_answer(salvaged):
+                return salvaged
+            raise RuntimeError(
+                f"skill {skill.name} timed out after {skill.timeout_seconds}s with no usable answer"
+            ) from exc
         stdout = completed.stdout.strip()
         if completed.returncode != 0:
             # A skill may deliberately emit a well-formed answer just before

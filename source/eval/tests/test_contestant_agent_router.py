@@ -263,6 +263,44 @@ class ContestantAgentRouterTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(route)
 
+    async def test_java_tax_inprocess_fallback_when_skill_route_dies(self) -> None:
+        """If skill_run raises (e.g. the subprocess is killed on timeout — the
+        exact-zero mechanism), solve() must still return a correct, version-
+        prefixed answer computed in-process, never the version-less model loop.
+        """
+        # The model loop is disabled, so any answer here PROVES it came from the
+        # deterministic in-process fallback, not the model.
+        os.environ["AGENT_DEMO_USE_LLM"] = "false"
+
+        class _DyingContext(_StubContext):
+            async def call_tool(self, name, args):
+                self.calls.append((name, args))
+                raise RuntimeError("skill subprocess killed (timeout)")
+
+        public_source = (
+            Path(__file__).resolve().parents[3]
+            / "publish" / "publish_V1" / "JavaSource_7_1.java"
+        )
+        task_text = "隐藏用例\n5000\n12000\n25000\n35000\n55000\n60000\n80000\n90000\n150000\n500000"
+        context = _DyingContext(allowed_file_paths=[str(public_source)])
+        answer = await self.agent.solve(
+            question={
+                "title": "Java个人所得税计算器",
+                "question": task_text,
+                "files": [str(public_source)],
+            },
+            context=context,
+        )
+        self.assertEqual(context.calls[0][0], "skill_run")  # the route was attempted
+        segments = answer.split(",")
+        self.assertEqual(len(segments), 11)
+        self.assertIn("21.0.11", segments[0])
+        self.assertEqual(
+            segments[1:],
+            ["0.00", "290.00", "1340.00", "3090.00", "7840.00", "9340.00",
+             "11090.00", "22940.00", "49940.00", "207440.00"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
