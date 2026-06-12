@@ -510,28 +510,52 @@ def _extract_json_array(text: str) -> Optional[List[Any]]:
     return None
 
 
+def _catalog_prompt_items(catalog: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for key in ("detail", "search", "update", "batch_status", "delete", "note_create", "stat_active"):
+        endpoint = catalog.get(key) or {}
+        path = endpoint.get("path", "")
+        if not path:
+            continue
+        method = endpoint.get("method") or ("GET" if key in {"detail", "search", "stat_active"} else "POST")
+        item: Dict[str, Any] = {
+            "endpoint_key": key,
+            "title": str(endpoint.get("title") or "").strip(),
+            "method": method,
+            "path_template": path,
+            "write": method.upper() in _WRITE_METHODS,
+        }
+        if endpoint.get("path_params"):
+            item["path_params"] = endpoint["path_params"]
+        if endpoint.get("query_params"):
+            item["query_params"] = endpoint["query_params"]
+        if endpoint.get("request_body_fields"):
+            item["request_body_fields"] = endpoint["request_body_fields"]
+        items.append(item)
+    return items
+
+
 def build_steps_prompt(description: str, api_doc: str, auth: Dict[str, Any]) -> str:
     """Assemble the per-case prompt: translate a description into HTTP steps.
 
-    The model is constrained to OUTPUT ONLY a JSON array of step objects, using
-    paths/params taken from the API doc, marking each step read or write, and
-    naming which step's response to assert. It must NOT decide pass/fail and must
-    NOT invent endpoints not in the doc.
+    The model is constrained to choose endpoint keys from a code-derived
+    catalogue and fill only params/bodies. It must NOT decide pass/fail, copy
+    assertions, or invent URLs.
     """
+    catalog = parse_endpoint_catalog(api_doc)
+    endpoints_json = json.dumps(_catalog_prompt_items(catalog), ensure_ascii=False, indent=2)
     schema = (
-        "Output ONLY a JSON array (no prose, no code fence). Each element is one "
-        "HTTP step:\n"
-        '  {"method":"GET|POST|PUT|PATCH|DELETE", "path":"/api/...", '
-        '"query":{...}, "body":{...}, "write":true|false, "assert":true|false, '
-        '"reuse_token":true|false}\n'
+        "Output ONLY a JSON array (no prose, no code fence). Each element is one HTTP step:\n"
+        '  {"endpoint_key":"one key from the endpoint catalogue", '
+        '"path_params":{...}, "query":{...}, "body":{...}, '
+        '"assert":true|false, "reuse_token":true|false}\n'
         "Rules:\n"
-        "- Use ONLY endpoints, paths and parameter names that appear in the API "
-        "doc below. Substitute path params (e.g. {userId}) with concrete values "
-        "from the description.\n"
-        "- Put query-string parameters in \"query\" and JSON request bodies in "
-        "\"body\". Omit \"query\"/\"body\" when not needed.\n"
-        "- \"write\": true for endpoints that modify data (they need an auth "
-        "token); false for read-only endpoints.\n"
+        "- Do NOT output method/path/write. Python will resolve those from endpoint_key.\n"
+        "- endpoint_key MUST be one of the endpoint catalogue keys below.\n"
+        "- Use the exact field names shown in path_params/query_params/"
+        "request_body_fields; do not invent aliases.\n"
+        "- Put path placeholders such as userId into \"path_params\".\n"
+        "- Put query-string parameters in \"query\" and JSON request bodies in \"body\".\n"
         "- \"assert\": true on the ONE step whose response must be checked "
         "(by default the LAST step the description says to verify). All other "
         "steps assert:false.\n"
@@ -545,8 +569,8 @@ def build_steps_prompt(description: str, api_doc: str, auth: Dict[str, Any]) -> 
         "You translate one test case's natural-language description into ordered "
         "HTTP steps against a service at %s.\n\n"
         "Case description:\n%s\n\n"
-        "API documentation:\n%s\n\n"
-        "%s" % (base_url, (description or "").strip(), (api_doc or "").strip(), schema)
+        "Endpoint catalogue (the ONLY allowed endpoint_key values):\n%s\n\n"
+        "%s" % (base_url, (description or "").strip(), endpoints_json, schema)
     )
 
 
@@ -569,7 +593,99 @@ def parse_steps(
     steps = _extract_json_array(raw)
     if not steps:
         return []
-    return [_normalise_step(step) for step in steps if isinstance(step, dict)]
+    catalog = parse_endpoint_catalog(api_doc)
+    result: List[Dict[str, Any]] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        normalised = _normalise_model_step(step, catalog)
+        if normalised.get("path"):
+            result.append(normalised)
+    return result
+
+
+_ENDPOINT_KEY_ALIASES = {
+    "user_detail": "detail",
+    "detail_user": "detail",
+    "get_user_detail": "detail",
+    "user_search": "search",
+    "search_user": "search",
+    "list_users": "search",
+    "update_user": "update",
+    "batch_update_status": "batch_status",
+    "batch_status_update": "batch_status",
+    "delete_user": "delete",
+    "remove_user": "delete",
+    "create_note": "note_create",
+    "user_note_create": "note_create",
+    "active_stat": "stat_active",
+    "stat_active_users": "stat_active",
+}
+
+
+def _canonical_endpoint_key(raw_key: Any) -> str:
+    key = str(raw_key or "").strip().lower().replace("-", "_")
+    return _ENDPOINT_KEY_ALIASES.get(key, key)
+
+
+def _fill_path_params(path: str, path_params: Dict[str, Any], body: Any, query: Dict[str, Any]) -> str:
+    params = {str(key).lower(): str(value) for key, value in path_params.items() if value is not None}
+    if isinstance(body, dict):
+        for key, value in body.items():
+            if value is not None:
+                params.setdefault(str(key).lower(), str(value))
+    for key, value in query.items():
+        if value is not None:
+            params.setdefault(str(key).lower(), str(value))
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        lowered = name.lower()
+        if lowered in params:
+            return params[lowered]
+        if "user" in lowered and "userid" in params:
+            return params["userid"]
+        return match.group(0)
+
+    return re.sub(r"\{([^}]+)\}", replace, path)
+
+
+def _normalise_model_step(step: Dict[str, Any], catalog: Dict[str, Dict[str, str]]) -> Dict[str, Any]:
+    """Resolve a model step from endpoint_key into an executable HTTP step."""
+    endpoint_key = _canonical_endpoint_key(step.get("endpoint_key") or step.get("endpoint"))
+    endpoint = dict(catalog.get(endpoint_key) or {})
+
+    # Strict primary path: model chooses endpoint_key. Compatibility fallback:
+    # accept a raw path only if it exactly matches a documented endpoint.
+    if not endpoint and step.get("path"):
+        raw_path = str(step.get("path") or "")
+        for candidate in catalog.values():
+            if candidate.get("path") == raw_path:
+                endpoint = dict(candidate)
+                break
+
+    if not endpoint.get("path"):
+        return _normalise_step({"method": "GET", "path": ""})
+
+    query = step.get("query") if isinstance(step.get("query"), dict) else {}
+    body = step.get("body") if isinstance(step.get("body"), (dict, list)) else None
+    path_params = step.get("path_params") if isinstance(step.get("path_params"), dict) else {}
+    method = str(endpoint.get("method") or "GET").upper()
+    path = _fill_path_params(str(endpoint.get("path") or ""), path_params, body, dict(query))
+    if "{" in path and "}" in path:
+        return _normalise_step({"method": method, "path": ""})
+
+    return _normalise_step(
+        {
+            "method": method,
+            "path": path,
+            "query": query,
+            "body": body,
+            "write": method in _WRITE_METHODS,
+            "assert": bool(step.get("assert")),
+            "reuse_token": bool(step.get("reuse_token")),
+        }
+    )
 
 
 def _normalise_step(step: Dict[str, Any]) -> Dict[str, Any]:
@@ -617,7 +733,96 @@ _PATH_TOKEN_RE = re.compile(
 _METHOD_TOKEN_RE = re.compile(r"\b(GET|POST|PUT|PATCH|DELETE)\b", re.IGNORECASE)
 
 
-def parse_endpoint_catalog(api_doc: str) -> Dict[str, Dict[str, str]]:
+def _api_doc_sections(api_doc: str) -> List[str]:
+    sections: List[str] = []
+    current: List[str] = []
+    for line in (api_doc or "").splitlines():
+        if line.lstrip().startswith("###"):
+            if current:
+                sections.append("\n".join(current))
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        sections.append("\n".join(current))
+    return sections
+
+
+def _section_for_path(api_doc: str, path: str) -> str:
+    if not path:
+        return ""
+    for section in _api_doc_sections(api_doc):
+        if path in section:
+            return section
+    return ""
+
+
+def _param_fields_from_section(section: str, label: str) -> List[str]:
+    fields: List[str] = []
+    collecting = False
+    label_lower = label.lower()
+    for raw_line in section.splitlines():
+        line = raw_line.strip()
+        lower = line.lower()
+        if line.startswith("-") and label_lower in lower and "`" not in line:
+            collecting = True
+            continue
+        if not collecting:
+            continue
+        if line.startswith("###") or line.startswith("```"):
+            break
+        if line.startswith("- ") and "`" not in line and re.search("[:\uFF1A]\\s*$", line):
+            break
+        match = re.match("-\\s*`?([A-Za-z][A-Za-z0-9_.-]*)`?\\s*[:\uFF1A]", line)
+        if match:
+            field = match.group(1)
+            if field not in fields:
+                fields.append(field)
+    return fields
+
+
+def _top_level_json_fields(value: Any) -> List[str]:
+    if isinstance(value, dict):
+        return [str(key) for key in value.keys()]
+    if isinstance(value, list) and value and isinstance(value[0], dict):
+        return [str(key) for key in value[0].keys()]
+    return []
+
+
+def _request_body_fields_from_section(section: str) -> List[str]:
+    for match in re.finditer(r"```json\s*(.*?)\s*```", section, re.IGNORECASE | re.DOTALL):
+        try:
+            value = json.loads(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        fields = _top_level_json_fields(value)
+        if fields:
+            return fields
+    return []
+
+
+def _endpoint_doc_hints(api_doc: str, endpoint: Dict[str, str]) -> Dict[str, Any]:
+    path = str(endpoint.get("path") or "")
+    section = _section_for_path(api_doc, path)
+    if not section:
+        return {}
+
+    hints: Dict[str, Any] = {}
+    path_params = _param_fields_from_section(section, "Path")
+    if not path_params:
+        path_params = re.findall(r"\{([^}]+)\}", path)
+    query_params = _param_fields_from_section(section, "Query")
+    body_fields = _request_body_fields_from_section(section)
+    if path_params:
+        hints["path_params"] = path_params
+    if query_params:
+        hints["query_params"] = query_params
+    if body_fields:
+        hints["request_body_fields"] = body_fields
+    return hints
+
+
+def parse_endpoint_catalog(api_doc: str) -> Dict[str, Dict[str, Any]]:
     """Extract endpoint paths/methods from the markdown API catalogue."""
     endpoints: List[Dict[str, str]] = []
     current: Dict[str, str] = {"title": "", "path": "", "method": ""}
@@ -677,9 +882,13 @@ def parse_endpoint_catalog(api_doc: str) -> Dict[str, Dict[str, str]]:
                 return endpoint
         return {}
 
-    return {kind: pick(kind) for kind in (
-        "detail", "search", "update", "batch_status", "delete", "note_create", "stat_active"
-    )}
+    catalog: Dict[str, Dict[str, Any]] = {}
+    for kind in ("detail", "search", "update", "batch_status", "delete", "note_create", "stat_active"):
+        endpoint = dict(pick(kind))
+        if endpoint:
+            endpoint.update(_endpoint_doc_hints(api_doc, endpoint))
+        catalog[kind] = endpoint
+    return catalog
 
 
 def _endpoint(catalog: Dict[str, Dict[str, str]], kind: str, fallback_path: str, fallback_method: str) -> Dict[str, str]:

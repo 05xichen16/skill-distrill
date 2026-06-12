@@ -223,6 +223,137 @@ class StepParsingHelpersTest(unittest.TestCase):
         text = 'prose [{"a":1}] trailing'
         self.assertEqual(MOD._extract_json_array(text), [{"a": 1}])
 
+    def test_model_endpoint_key_resolves_to_documented_path(self) -> None:
+        catalog = MOD.parse_endpoint_catalog(PUBLIC_API_DOC)
+        step = MOD._normalise_model_step(
+            {
+                "endpoint_key": "detail",
+                "path_params": {"userId": "U1010"},
+                "query": {"verbose": True},
+                "assert": True,
+            },
+            catalog,
+        )
+        self.assertEqual(step["method"], "GET")
+        self.assertEqual(step["path"], "/api/user/detail/U1010")
+        self.assertEqual(step["query"], {"verbose": True})
+        self.assertTrue(step["assert"])
+
+    def test_model_unknown_endpoint_key_is_rejected(self) -> None:
+        catalog = MOD.parse_endpoint_catalog(PUBLIC_API_DOC)
+        step = MOD._normalise_model_step(
+            {"endpoint_key": "totally_unknown", "query": {}, "assert": True},
+            catalog,
+        )
+        self.assertEqual(step["path"], "")
+
+    def test_model_missing_path_param_is_rejected(self) -> None:
+        catalog = MOD.parse_endpoint_catalog(PUBLIC_API_DOC)
+        step = MOD._normalise_model_step(
+            {"endpoint_key": "detail", "path_params": {}, "assert": True},
+            catalog,
+        )
+        self.assertEqual(step["path"], "")
+
+    def test_parse_steps_uses_endpoint_key_schema(self) -> None:
+        raw = json.dumps(
+            [
+                {
+                    "endpoint_key": "update",
+                    "body": {"userId": "U1003", "title": "Lead"},
+                    "assert": False,
+                },
+                {
+                    "endpoint_key": "detail",
+                    "path_params": {"userId": "U1003"},
+                    "assert": True,
+                },
+            ]
+        )
+        old_call = MOD._call_model
+        try:
+            MOD._call_model = lambda config, prompt, timeout: raw
+            steps = MOD.parse_steps(
+                {"url": "u", "api_key": "k", "model": "m", "package_id": ""},
+                "update then read",
+                PUBLIC_API_DOC,
+                MOD.build_auth(AUTH_CONFIG),
+                5,
+            )
+        finally:
+            MOD._call_model = old_call
+        self.assertEqual(len(steps), 2)
+        self.assertEqual(steps[0]["path"], "/api/user/update")
+        self.assertEqual(steps[0]["method"], "POST")
+        self.assertTrue(steps[0]["write"])
+        self.assertEqual(steps[1]["path"], "/api/user/detail/U1003")
+        self.assertTrue(steps[1]["assert"])
+
+    def test_endpoint_catalog_includes_param_and_body_hints(self) -> None:
+        api_doc = """
+### User detail
+- Path: `/api/user/detail/{userId}`
+- Method: `GET`
+- Path params:
+  - `userId`: user ID
+- Query params:
+  - `verbose`: return expanded detail
+
+### Search users
+- Path: `/api/user/search`
+- Method: `GET`
+- Query params:
+  - `status`: active or inactive
+  - `page`: page number
+
+### Update user
+- Path: `/api/user/update`
+- Method: `POST`
+
+Request body example:
+
+```json
+{
+  "userId": "U1003",
+  "email": "u1003@example.com",
+  "title": "Senior Engineer"
+}
+```
+"""
+        catalog = MOD.parse_endpoint_catalog(api_doc)
+        self.assertEqual(catalog["detail"]["path_params"], ["userId"])
+        self.assertEqual(catalog["detail"]["query_params"], ["verbose"])
+        self.assertEqual(catalog["search"]["query_params"], ["status", "page"])
+        self.assertEqual(catalog["update"]["request_body_fields"], ["userId", "email", "title"])
+
+    def test_build_steps_prompt_includes_request_field_hints(self) -> None:
+        api_doc = """
+### Update user
+- Path: `/api/user/update`
+- Method: `POST`
+
+Request body example:
+
+```json
+{
+  "userId": "U1003",
+  "email": "u1003@example.com",
+  "title": "Senior Engineer"
+}
+```
+"""
+        prompt = MOD.build_steps_prompt("更新用户 U1003 的职级为 Senior Engineer", api_doc, MOD.build_auth(AUTH_CONFIG))
+        self.assertIn("request_body_fields", prompt)
+        self.assertIn("\"title\"", prompt)
+        self.assertIn("do not invent aliases", prompt)
+
+    def test_build_steps_prompt_does_not_invite_assertion_rewrite(self) -> None:
+        prompt = MOD.build_steps_prompt("查询用户 U1 详情", PUBLIC_API_DOC, MOD.build_auth(AUTH_CONFIG))
+        self.assertIn("endpoint_key", prompt)
+        self.assertIn("Do NOT output method/path/write", prompt)
+        self.assertIn("Python will resolve", prompt)
+        self.assertNotIn("expectedValues", prompt)
+
 
 class DeterministicInferenceTest(unittest.TestCase):
     def test_english_one_line_endpoint_catalog(self) -> None:

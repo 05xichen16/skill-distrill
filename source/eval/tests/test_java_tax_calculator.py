@@ -367,6 +367,98 @@ class AnswerFallbackChainTest(unittest.TestCase):
         self.assertEqual(result["path"], "unverified")
 
 
+class JavacPrimaryPathTest(unittest.TestCase):
+    """The javac repair path is primary: when the toolchain + model are
+    available it runs first and wins, without touching the python extractor.
+    Running the real program is what makes hidden variants correct, so this
+    ordering is load-bearing for the platform score."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+        self.module.java_toolchain_available = lambda: True
+        self.module._model_config = lambda: {"url": "u", "api_key": "k", "model": "m", "package_id": ""}
+        self.module.java_version_line = lambda: 'java version "21.0.11"'
+        # A successful repair-compile-run: the model returns any class, it
+        # "compiles", and every case runs to the reference tax.
+        self.module._call_model = lambda config, prompt, timeout: "public class C {}"
+        self.module.compile_java = lambda source, work_dir: ("C", "")
+        self.module.run_java_case = lambda cls, work_dir, salary: _expected_tax(salary)
+
+    def _answer_for(self, source: str) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "JavaSource_7_1.java")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(source)
+            return self.module.answer(
+                {"task_description": TASK_TEXT, "source_file": path, "_runtime": {}}
+            )
+
+    def test_javac_path_is_primary_and_does_not_call_python(self) -> None:
+        # If the python extractor were consulted it would raise loudly.
+        def must_not_run(*args, **kwargs):
+            raise AssertionError("python extraction must not run when javac wins")
+
+        self.module.try_python_path = must_not_run
+        result = self._answer_for("public class JavaSource_7_1 { /* buggy */ }")
+        self.assertEqual(result["path"], "java")
+        segments = result["answer"].split(",")
+        self.assertEqual(len(segments), 11)
+        self.assertIn("21.0.11", segments[0])
+        self.assertEqual(
+            segments[1:], [_expected_tax(s) for s in self.module.hidden_salaries(TASK_TEXT)]
+        )
+
+    def test_prefer_javac_false_uses_python(self) -> None:
+        os.environ["JAVA_TAX_PREFER_JAVAC"] = "false"
+        try:
+            # javac would succeed, but the flag forces the python decode path
+            # (the public source decodes cleanly -> same answer, path=python).
+            result = self._answer_for(PUBLIC_SOURCE.read_text(encoding="utf-8"))
+        finally:
+            os.environ.pop("JAVA_TAX_PREFER_JAVAC", None)
+        self.assertEqual(result["path"], "python")
+        segments = result["answer"].split(",")
+        self.assertEqual(
+            segments[1:], [_expected_tax(s) for s in self.module.hidden_salaries(TASK_TEXT)]
+        )
+
+    def test_javac_failure_falls_back_to_python(self) -> None:
+        # javac path can never validate (compile always fails); the python
+        # decode of the public source must still rescue a correct answer.
+        self.module.compile_java = lambda source, work_dir: (None, "boom")
+        result = self._answer_for(PUBLIC_SOURCE.read_text(encoding="utf-8"))
+        self.assertEqual(result["path"], "python")
+        segments = result["answer"].split(",")
+        self.assertEqual(
+            segments[1:], [_expected_tax(s) for s in self.module.hidden_salaries(TASK_TEXT)]
+        )
+
+
+class ThinkingDisabledPayloadTest(unittest.TestCase):
+    """The repair/extract calls must disable reasoning on BOTH gateway dialects:
+    top-level enable_thinking (DashScope-compatible) and chat_template_kwargs
+    (contest gateway). With reasoning on, the bounded timeout truncates the
+    source and the javac path collapses -- the platform-run failure mode."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    def test_payload_disables_thinking_on_both_knobs(self) -> None:
+        captured = {}
+
+        def fake_post(url, body, headers, timeout):
+            captured["payload"] = json.loads(body.decode("utf-8"))
+            return json.dumps({"choices": [{"message": {"content": "ok"}}]})
+
+        self.module._post_model_request = fake_post
+        config = {"url": "u", "api_key": "k", "model": "m", "package_id": ""}
+        self.module._call_model(config, "p", 5)
+        payload = captured["payload"]
+        self.assertIn("enable_thinking", payload)
+        self.assertFalse(payload["enable_thinking"])
+        self.assertFalse(payload["chat_template_kwargs"]["enable_thinking"])
+
+
 class DeadlineSelfProtectionTest(unittest.TestCase):
     """A tiny SKILL_BUDGET_SECONDS must skip all model work (java repair
     rounds and the python extraction call) yet still emit a shaped answer."""
