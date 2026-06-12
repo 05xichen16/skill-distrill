@@ -1,0 +1,6 @@
+From: 周慕云 <zhou.muyun@acme.io>
+To: 采购支持 <buy@acme.io>
+Date: 2026年6月20日
+Subject: Re: PO-V-03 整单确认
+
+整单核准。机架主机、网络交换机和员工商务笔记本 都在本次批准范围内，金额 80000 封顶。

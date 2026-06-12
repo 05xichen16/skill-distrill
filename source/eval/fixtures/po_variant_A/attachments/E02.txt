@@ -1,0 +1,6 @@
+From: 何向晚 <he.xiangwan@acme.io>
+To: 采购支持 <buy@acme.io>
+Date: 2026/6/1
+Subject: Re: PO-V-02 服务确认
+
+渗透测试和漏洞扫描 两项均已核验无误，照此办理，金额按 70000 封顶。

@@ -1,0 +1,15 @@
+From: 采购支持 <buy@acme.io>
+To: 何向晚 <he.xiangwan@acme.io>
+Date: 2026年8月25日
+Subject: PO-V-09 是否纳入本次确认
+
+这封能否覆盖 PO-V-09？内容是 数据质量规则和血缘梳理，供应商 慧治数据顾问。
+
+---
+
+From: 何向晚 <he.xiangwan@acme.io>
+To: 采购支持 <buy@acme.io>
+Date: 2026年8月26日
+Subject: Re: PO-V-09 是否纳入本次确认
+
+该项请按原单据编号归档，本次不予确认。

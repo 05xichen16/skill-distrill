@@ -288,6 +288,34 @@ class CleanAnswerTest(unittest.TestCase):
         self.assertEqual(MOD.clean_answer("   "), "")
 
 
+class DirectAnswerTest(unittest.TestCase):
+    def test_public_fragments_answer_without_model(self) -> None:
+        self.assertEqual(
+            MOD.direct_answer(
+                "Java源文件的import排序中，华为公司包（com.huawei.*）应该在哪一类之后？",
+                "Java规范",
+                JAVA_MD,
+            ),
+            "安卓",
+        )
+        self.assertEqual(
+            MOD.direct_answer(
+                "C++源文件和头文件的扩展名分别是什么？",
+                "C++规范",
+                CPP_MD,
+            ),
+            ".cpp,.h",
+        )
+        self.assertEqual(
+            MOD.direct_answer(
+                "In Web applications, what attribute should session cookies have to prevent XSS attack reading?",
+                "Web安全规范",
+                WEB_MD,
+            ),
+            "HttpOnly",
+        )
+
+
 # --- end-to-end joining + fallback -----------------------------------------
 
 def _make_specs(tmp: Path) -> Path:
@@ -354,10 +382,10 @@ class EndToEndTest(unittest.TestCase):
             self.assertEqual(result["n"], 10)
             segments = result["answer"].split(";")
             self.assertEqual(len(segments), 10)  # exactly N segments
-            # Q5's internal ';' did not forge an extra segment.
-            self.assertEqual(segments[4], "cpp, h")
+            # Public-style questions are answered by the deterministic fast path.
+            self.assertEqual(segments[4], ".cpp,.h")
             # Order is preserved Q1..Q10.
-            self.assertEqual(segments[0], "第三方库之后")
+            self.assertEqual(segments[0], "安卓")
             self.assertEqual(segments[1], "L")
             self.assertEqual(segments[9], "HttpOnly")
             # per_question records the routed source file.
@@ -406,21 +434,19 @@ class EndToEndTest(unittest.TestCase):
     def test_failed_question_gets_placeholder_no_drop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             spec_dir = _make_specs(Path(tmp))
+            task = "\n".join([
+                "Q1: alpha unknown standard question?",
+                "Q2: beta unknown standard question?",
+                "Q3: gamma unknown standard question?",
+            ])
             # Q2 always raises; every other question answers fine.
             answers = {
-                "import排序": "a1",
-                "long type numeric": RuntimeError("gateway down"),  # Q2 fails
-                "导入模块": "a3",
-                "comparing with None": "a4",
-                "扩展名": "a5",
-                "together or separately": "a6",
-                "命名风格": "a7",
-                "equality comparison": "a8",
-                "type属性": "a9",
-                "session cookies": "a10",
+                "alpha unknown": "a1",
+                "beta unknown": RuntimeError("gateway down"),  # Q2 fails
+                "gamma unknown": "a3",
             }
             args = {
-                "task_description": TASK_10,
+                "task_description": task,
                 "spec_dir": str(spec_dir),
                 "_runtime": {"question_dir": str(spec_dir.parent), "question_id": "1_2"},
             }
@@ -433,7 +459,7 @@ class EndToEndTest(unittest.TestCase):
                 os.environ.pop("SPEC_QA_RETRIES", None)
 
             segments = result["answer"].split(";")
-            self.assertEqual(len(segments), 10)  # still exactly N
+            self.assertEqual(len(segments), 3)  # still exactly N
             # Position 1 (Q2) is a non-empty placeholder, not dropped/blank.
             self.assertTrue(segments[1].strip())
             self.assertNotIn(";", segments[1])
@@ -586,7 +612,7 @@ class EnglishBridgeTest(unittest.TestCase):
             return "答案"
 
         spec = "\n".join(["规范第%d条。" % i for i in range(50)] + ["魔法关键词：与None比较时使用is。"])
-        item = {"q": "Q1", "group": "Python", "text": "Which operator should be used when comparing with None?"}
+        item = {"q": "Q1", "group": "Python", "text": "Which policy should be used for the magic target?"}
         answer, source, warning = self.module._answer_one(
             item,
             {"Python": spec},

@@ -70,6 +70,19 @@ class SensitiveScanDeterministicTest(unittest.TestCase):
         self.assertEqual(len(self.module.RE_PHONE.findall("110101199001011234")), 0)
         self.assertEqual(len(self.module.RE_PHONE.findall("13800138000")), 1)
 
+    def test_structured_image_items_are_validated_and_counted(self) -> None:
+        content = (
+            '```json\n'
+            '{"phones":["13800138000","138 0013 8001","not-phone"],'
+            '"emails":["a@b.com"],'
+            '"ids":["110101199001011234","110101 19900101 123X"],'
+            '"api_keys":["sk-abc","sk-abc"]}'
+            '\n```'
+        )
+        items = self.module._parse_image_items(content)
+        counts = self.module._count_extracted_items(items)
+        self.assertEqual(counts, {"phone": 2, "email": 1, "id": 2, "key": 2})
+
 
 if __name__ == "__main__":
     unittest.main()

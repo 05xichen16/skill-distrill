@@ -1,9 +1,9 @@
-"""Concurrent-OCR behavior tests for the sensitive_scan skill.
+"""Concurrent image-extraction behavior tests for the sensitive_scan skill.
 
-The production gateway takes ~50-60s per image; 6 sequential images exceed the
-300s skill timeout and the whole scan got killed (platform 2_2 = 0). These
+The production gateway takes ~50-60s per image; many sequential images can
+exceed the skill timeout and the whole scan gets killed. These
 tests pin the new behavior with a mocked gateway, fully offline:
-  * images are OCR'd concurrently (wall-clock ~ one image, not the sum)
+  * images are processed concurrently (wall-clock ~ one image, not the sum)
   * one image failing (after retries) degrades to a warning + zero counts
   * retry succeeds on a flaky-then-ok image
 
@@ -51,7 +51,7 @@ def _archive_with_images(count: int) -> bytes:
 class SensitiveScanConcurrencyTest(unittest.TestCase):
     def setUp(self) -> None:
         self.module = _load_skill_module()
-        # Pretend the gateway is configured; ocr_image is mocked per-test.
+        # Pretend the gateway is configured; extract_image_counts is mocked per-test.
         self.module._model_config = lambda: {
             "url": "http://mock",
             "api_key": "k",
@@ -72,16 +72,16 @@ class SensitiveScanConcurrencyTest(unittest.TestCase):
         in_flight = {"now": 0, "peak": 0}
         lock = threading.Lock()
 
-        def slow_ocr(config, name, data, timeout):
+        def slow_extract(config, name, data, timeout):
             with lock:
                 in_flight["now"] += 1
                 in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
             time.sleep(0.2)
             with lock:
                 in_flight["now"] -= 1
-            return "13800138001"
+            return {"phone": 1, "email": 0, "id": 0, "key": 0}
 
-        self.module.ocr_image = slow_ocr
+        self.module.extract_image_counts = slow_extract
         started = time.monotonic()
         result = self._scan(_archive_with_images(4), "conc.zip")
         elapsed = time.monotonic() - started
@@ -94,12 +94,12 @@ class SensitiveScanConcurrencyTest(unittest.TestCase):
         self.assertEqual(result["breakdown"]["image"][0], 4)
 
     def test_single_failure_degrades_not_kills(self) -> None:
-        def flaky_ocr(config, name, data, timeout):
+        def flaky_extract(config, name, data, timeout):
             if name.endswith("img_1.png"):
                 raise RuntimeError("gateway boom")
-            return "id 110101199001011234"
+            return {"phone": 0, "email": 0, "id": 1, "key": 0}
 
-        self.module.ocr_image = flaky_ocr
+        self.module.extract_image_counts = flaky_extract
         result = self._scan(_archive_with_images(3), "fail.zip")
 
         self.assertEqual(result["images_ocr_ok"], 2)
@@ -117,9 +117,9 @@ class SensitiveScanConcurrencyTest(unittest.TestCase):
                 attempts[name] = attempts.get(name, 0) + 1
                 if attempts[name] == 1:
                     raise RuntimeError("transient")
-            return "sk-abcdef123"
+            return {"phone": 0, "email": 0, "id": 0, "key": 1}
 
-        self.module.ocr_image = flaky_then_ok
+        self.module.extract_image_counts = flaky_then_ok
         result = self._scan(_archive_with_images(2), "retry.zip")
 
         self.assertEqual(result["images_ocr_ok"], 2)

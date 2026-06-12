@@ -1,0 +1,7 @@
+person_id,display_name,email,role,valid_from,valid_to
+Q001,周慕云,zhou.muyun@acme.io,VP,2026-01-01,2026-12-31
+Q002,何向晚,he.xiangwan@acme.io,VP,2026-03-01,2026-09-30
+Q003,罗子谦,luo.ziqian@acme.io,Director,2026-01-01,2026-12-31
+Q004,田铮,tian.zheng@acme.io,Manager,2026-01-01,2026-12-31
+Q005,蒋蕙,jiang.hui@acme.io,VP Assistant,2026-01-01,2026-12-31
+Q006,韦昭,wei.zhao@acme.io,VP,2025-01-01,2026-02-28

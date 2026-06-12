@@ -1,0 +1,6 @@
+From: 周慕云 <zhou.muyun@acme.io>
+To: 采购支持 <buy@acme.io>
+Date: 2026年7月20日
+Subject: Re: PO-V-04 采购确认
+
+商务笔记本 这项先核准，可以让供应商先备货。外接显示器和扩展底座 等预算复核后再议，暂不并入本次确认。

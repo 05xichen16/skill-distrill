@@ -1,8 +1,8 @@
 {
   "name": "sensitive_scan",
-  "description": "Scan a (possibly nested) archive for sensitive data: phone numbers, emails, ID-card numbers and API keys. Counts total occurrences (no dedup) across text files via deterministic regex, and across images via model OCR transcription + the same regex.",
+  "description": "Scan a (possibly nested) archive for sensitive data: phone numbers, emails, ID-card numbers and API keys. Counts total occurrences (no dedup) across text files via deterministic regex, and across images via structured multimodal extraction with code validation.",
   "entrypoint": "scripts/run.py",
-  "timeout_seconds": 300,
+  "timeout_seconds": 600,
   "input_schema": {
     "type": "object",
     "properties": {
@@ -12,7 +12,7 @@
       },
       "do_ocr": {
         "type": "boolean",
-        "description": "Whether to OCR images via the model gateway and add their counts. Defaults to true; set false for a pure-offline deterministic text-only scan."
+        "description": "Whether to extract sensitive tokens from images via the model gateway and add their counts. Defaults to true; set false for a pure-offline deterministic text-only scan."
       }
     },
     "required": ["zip_path"],

@@ -17,10 +17,11 @@ Use this skill for the "compressed-archive sensitive information scan" question
    - email: `user@domain.com`
    - ID card: 18 chars, 17 digits plus a trailing digit or `X`
    - API key: an `sk-` prefixed token
-3. For images, transcribes the text via the model gateway (OCR) and applies the
-   exact same regex to the transcription. If the model is not configured or the
-   call fails, OCR is skipped gracefully and the text-only counts are returned
-   with a warning (the skill never crashes).
+3. For images, asks the multimodal model to extract structured sensitive-token
+   lists (`phones`, `emails`, `ids`, `api_keys`) directly, then validates those
+   items in code before counting. If the model is not configured or the call
+   fails, image extraction is skipped gracefully and the text-only counts are
+   returned with a warning (the skill never crashes).
 
 ## How to call
 

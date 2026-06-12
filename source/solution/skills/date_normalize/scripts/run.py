@@ -408,6 +408,14 @@ def solve_line_hybrid(line: str, config: Optional[Dict[str, str]], timeout: int,
     except Exception:
         regex_value = None
 
+    if config is not None and needs_reasoning(line):
+        llm_value = _llm_line_date(config, line, timeout, retries)
+        if llm_value is not None:
+            return llm_value, "llm"
+        if regex_value is not None:
+            return regex_value, "regex"
+        return None, "failed"
+
     if regex_value is not None:
         return regex_value, "regex"
 

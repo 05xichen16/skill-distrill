@@ -1,0 +1,6 @@
+person_id,display_name,email,role,valid_from,valid_to
+R001,谢临川,xie.linchuan@beta.io,VP,2026-01-01,2026-12-31
+R002,江砚书,jiang.yanshu@beta.io,副总裁,2026-04-01,2026-12-31
+R003,卫青山,wei.qingshan@beta.io,Director,2026-01-01,2026-12-31
+R004,范成,fan.cheng@beta.io,VP,2025-06-01,2026-05-31
+R005,邹平,zou.ping@beta.io,Vice President,2026-01-01,2026-12-31

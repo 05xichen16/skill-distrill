@@ -1,0 +1,6 @@
+From: 罗子谦 <luo.ziqian@acme.io>
+To: 采购支持 <buy@acme.io>
+Date: 2026年4月2日
+Subject: Re: PO-V-05 采购确认
+
+渗透测试和基线核查 两项我看过，预算和必要性没问题，可以推进，金额按 65000 控制。

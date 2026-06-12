@@ -24,11 +24,11 @@ Result shape (stdout):
     }
 
 Counting is deterministic (boundary-aware regex, total occurrences, no dedup).
-Image OCR only *transcribes* text via the model gateway; the same regex then
-counts on the transcription, so counts stay deterministic. OCR degrades
-gracefully: if the model is unconfigured or fails, OCR is skipped and the
-text-only counts are returned with a warning. The skill never raises to the
-caller for OCR problems.
+Image extraction asks the multimodal model for structured sensitive-token lists
+per category, then code validates those items and counts occurrences. Image
+work degrades gracefully: if the model is unconfigured or fails, image counts
+are skipped and the text-only counts are returned with a warning. The skill
+never raises to the caller for image extraction problems.
 
 Pure standard library, Python 3.9 compatible.
 """
@@ -194,7 +194,7 @@ def resolve_archive_path(zip_path: str, runtime: Dict[str, Any]) -> str:
     return candidates[0]
 
 
-# --- image OCR (graceful) --------------------------------------------------
+# --- image extraction (graceful) -------------------------------------------
 
 def _model_config() -> Optional[Dict[str, str]]:
     """Build model config from the environment, or None if not configured."""
@@ -226,16 +226,19 @@ def _image_mime(name: str) -> str:
     return "image/png"
 
 
-_OCR_PROMPT = (
-    "Transcribe ALL text visible in this image verbatim, character by character. "
-    "Include every phone number, email address, ID number and API key exactly as "
-    "shown, preserving all digits and symbols. Output only the raw transcribed "
-    "text with no commentary."
+_IMAGE_EXTRACT_PROMPT = (
+    "You are reading one image for a sensitive-data counting task. Extract ONLY "
+    "the visible sensitive tokens and return strict JSON with exactly these keys: "
+    '{"phones":[],"emails":[],"ids":[],"api_keys":[]}. '
+    "Rules: phones are 11 digits starting with 1; emails are user@domain.com; "
+    "IDs are 18 characters with 17 digits plus a final digit or X; API keys start "
+    "with sk-. Include duplicate occurrences separately; do not deduplicate. "
+    "Do not include labels, explanations, markdown, or any text outside JSON."
 )
 
 
-def ocr_image(config: Dict[str, str], name: str, data: bytes, timeout: int) -> str:
-    """Call the model gateway to transcribe an image; return transcription text.
+def extract_image_counts(config: Dict[str, str], name: str, data: bytes, timeout: int) -> Dict[str, int]:
+    """Call the model gateway to extract image tokens; return validated counts.
 
     Raises on failure; the caller handles graceful degradation.
     """
@@ -254,7 +257,7 @@ def ocr_image(config: Dict[str, str], name: str, data: bytes, timeout: int) -> s
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": _OCR_PROMPT},
+                    {"type": "text", "text": _IMAGE_EXTRACT_PROMPT},
                     {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             }
@@ -277,7 +280,106 @@ def ocr_image(config: Dict[str, str], name: str, data: bytes, timeout: int) -> s
     except http.client.RemoteDisconnected:
         raw = _post_with_http_client(config["url"], body, headers, timeout)
 
-    return _extract_content(raw)
+    content = _extract_content(raw)
+    items = _parse_image_items(content)
+    return _count_extracted_items(items)
+
+
+def _parse_image_items(content: str) -> Dict[str, List[str]]:
+    """Parse the model's strict JSON extraction result into category lists."""
+    text = re.sub(r"<think>.*?</think>", "", content or "", flags=re.DOTALL).strip()
+    candidates = [text]
+    candidates.extend(
+        match.group(1).strip()
+        for match in re.finditer(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL)
+    )
+    object_match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if object_match:
+        candidates.append(object_match.group(0))
+
+    parsed: Optional[Dict[str, Any]] = None
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, dict):
+            parsed = value
+            break
+    if parsed is None:
+        raise ValueError("image extraction did not return a JSON object")
+
+    aliases = {
+        "phone": ("phones", "phone", "手机号", "mobile", "mobiles"),
+        "email": ("emails", "email", "邮箱"),
+        "id": ("ids", "id", "id_cards", "idcards", "身份证", "身份证号"),
+        "key": ("api_keys", "apiKeys", "apikeys", "api_key", "keys", "key", "APIKey"),
+    }
+    result: Dict[str, List[str]] = {key: [] for key in ORDER}
+    for target, names in aliases.items():
+        for name in names:
+            if name in parsed:
+                result[target].extend(_coerce_items(parsed.get(name)))
+    return result
+
+
+def _coerce_items(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        items: List[str] = []
+        for item in value:
+            if isinstance(item, (str, int, float)):
+                text = str(item).strip()
+                if text and text.lower() not in {"none", "null", "n/a"}:
+                    items.append(text)
+        return items
+    if isinstance(value, (str, int, float)):
+        text = str(value).strip()
+        if not text or text.lower() in {"none", "null", "n/a"}:
+            return []
+        return [part.strip() for part in re.split(r"[\n,，;；]+", text) if part.strip()]
+    return []
+
+
+def _count_extracted_items(items: Dict[str, List[str]]) -> Dict[str, int]:
+    counts = _empty_counts()
+    for item in items.get("phone", []):
+        if _valid_phone_item(item):
+            counts["phone"] += 1
+    for item in items.get("email", []):
+        if _valid_email_item(item):
+            counts["email"] += 1
+    for item in items.get("id", []):
+        if _valid_id_item(item):
+            counts["id"] += 1
+    for item in items.get("key", []):
+        if _valid_key_item(item):
+            counts["key"] += 1
+    return counts
+
+
+def _valid_phone_item(item: str) -> bool:
+    if RE_PHONE.search(item):
+        return True
+    digits = re.sub(r"\D", "", item)
+    return bool(re.fullmatch(r"1\d{10}", digits))
+
+
+def _valid_email_item(item: str) -> bool:
+    return bool(RE_EMAIL.search(item))
+
+
+def _valid_id_item(item: str) -> bool:
+    if RE_ID.search(item):
+        return True
+    compact = re.sub(r"[^0-9Xx]", "", item)
+    return bool(re.fullmatch(r"\d{17}[\dXx]", compact))
+
+
+def _valid_key_item(item: str) -> bool:
+    text = item.strip().strip("\"'`，,;；。")
+    return bool(RE_KEY.search(text) or re.fullmatch(r"sk-[A-Za-z0-9._:/+=\-]+", text))
 
 
 def _post_with_http_client(url: str, body: bytes, headers: Dict[str, str], timeout: int) -> str:
@@ -345,7 +447,7 @@ def scan(args: Dict[str, Any]) -> Dict[str, Any]:
         config = _model_config()
         if config is None:
             warnings.append(
-                "model gateway not configured (MODEL_* env missing); skipped OCR for %d image(s)"
+                "model gateway not configured (MODEL_* env missing); skipped image extraction for %d image(s)"
                 % images_total
             )
         else:
@@ -354,19 +456,18 @@ def scan(args: Dict[str, Any]) -> Dict[str, Any]:
             workers = _env_int("SENSITIVE_SCAN_WORKERS", 4, minimum=1)
 
             # Bounded concurrency: the production gateway takes ~50-60s per
-            # image, so 6 sequential images blow past the 300s skill timeout.
-            # Concurrent OCR keeps wall-clock near a single image's latency.
+            # image, so many sequential images can blow past the skill timeout.
+            # Concurrent image extraction keeps wall-clock near a single image's latency.
             # One failed image degrades to a warning, never kills the scan.
             def ocr_one(item: Tuple[str, bytes]) -> Tuple[Dict[str, int], Optional[str]]:
                 name, data = item
                 last_exc: Optional[Exception] = None
                 for _ in range(retries):
                     try:
-                        transcription = ocr_image(config, name, data, timeout)
-                        return count_text(transcription), None
+                        return extract_image_counts(config, name, data, timeout), None
                     except Exception as exc:  # noqa: BLE001 - graceful degradation
                         last_exc = exc
-                return _empty_counts(), "OCR failed for %s: %s" % (name, last_exc)
+                return _empty_counts(), "image extraction failed for %s: %s" % (name, last_exc)
 
             if workers <= 1 or images_total == 1:
                 outcomes = [ocr_one(item) for item in collector.images]
@@ -381,7 +482,7 @@ def scan(args: Dict[str, Any]) -> Dict[str, Any]:
                     _add(image_counts, counts)
                     images_ocr_ok += 1
     elif do_ocr and not images_total:
-        # nothing to OCR
+        # nothing to extract from images
         pass
 
     total_counts = _empty_counts()
