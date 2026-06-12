@@ -920,6 +920,9 @@ def build_steps_prompt_raw(description: str, api_doc: str, auth: Dict[str, Any])
         "\"body\". Omit \"query\"/\"body\" when not needed.\n"
         "- \"write\": true for endpoints that modify data (they need an auth "
         "token); false for read-only endpoints.\n"
+        "- Do NOT emit a step for the token endpoint (e.g. POST /api/auth/token). "
+        "The runner fetches and attaches a fresh write token automatically before "
+        "each write:true step. Emit only the business endpoints the case calls.\n"
         "- \"assert\": true on the ONE step whose response must be checked "
         "(by default the LAST step the description says to verify). All other "
         "steps assert:false.\n"
@@ -1048,11 +1051,26 @@ def parse_steps(
     returns ``[]`` only when the model produced no usable steps.
     """
     catalog = parse_endpoint_catalog(api_doc)
-    if _count_catalog_paths(catalog) < CATALOG_MIN_ENDPOINTS:
-        # Global gate: the catalogue's fixed kinds missed most of the variant's
-        # endpoints; constraining the model to it would abstain the whole run.
+    catalog_usable = _count_catalog_paths(catalog) >= CATALOG_MIN_ENDPOINTS
+    # Raw-path mode (the model emits method+path against the FULL api_doc,
+    # validated against the doc text) generalises to ANY endpoint, so it is
+    # preferred when either:
+    #   (a) the catalogue is too thin to trust (a variant restructured the doc
+    #       beyond the fixed kinds), or
+    #   (b) the case mutates state / acquires a token: the fixed-kind catalogue
+    #       cannot express variant write endpoints (update-status, restore-
+    #       status, archive, tag/add, transfer-department, ...), and forcing the
+    #       model through it resolves those to a WRONG or empty endpoint - which
+    #       mis-executes (or skips) the write and cascades false failures into
+    #       every dependent stateful read.
+    # On a catalogue-rich public-style doc a write case whose raw reply yields
+    # no usable step still falls through to catalogue mode below rather than
+    # abstaining, so the proven public-set path is preserved.
+    if (not catalog_usable) or _has_write_intent(description):
         raw = _call_model(config, build_steps_prompt_raw(description, api_doc, auth), timeout)
-        return _normalise_raw_steps(_extract_json_array(raw) or [], api_doc)
+        raw_steps = _normalise_raw_steps(_extract_json_array(raw) or [], api_doc)
+        if raw_steps or not catalog_usable:
+            return raw_steps
 
     prompt = build_steps_prompt(description, api_doc, auth)
     raw = _call_model(config, prompt, timeout)
@@ -1528,6 +1546,45 @@ def _has_any_path(paths: List[str], *needles: str) -> bool:
     return any(any(needle in path for needle in needles) for path in paths)
 
 
+# Write-intent detection: does a case MUTATE state (so it must obtain a token
+# and hit a write endpoint), as opposed to a pure read? The patterns are
+# deliberately IMPERATIVE / token-acquisition forms so a read that merely
+# *mentions* a past write ("...校验前序更新后的邮箱", "...同 token 复用用例中第一次
+# 写入已生效") is NOT flagged - those say "更新后" / "token 复用" / "写入已生效",
+# none of which match. This matters because the fixed-kind endpoint catalogue
+# cannot express variant write endpoints (update-status, restore-status,
+# archive, tag/add, transfer-department, ...): if the pure-code inferrer cannot
+# build a confident write step for such a case it must ABSTAIN (-> model raw
+# mode) instead of falling through to a read request, which would never perform
+# the mutation and would cascade false failures into every dependent stateful
+# read (zeroing the position-sensitive ratio grader).
+_TOKEN_ACQUIRE_RE = re.compile(
+    r"获取\s*(?:访问)?\s*(?:token|令牌)"          # 获取 token / 获取访问令牌
+    r"|重新\s*获取\s*(?:token|令牌)"              # 重新获取 token
+    r"|复用.{0,8}(?:token|令牌)"                  # 复用上一个 token (reuse-write; 复用 BEFORE
+    r"|写接口|写操作"                             #   token, so "token 复用" in a read is NOT matched)
+    r"|get\s+(?:a\s+|an\s+)?(?:access\s+)?token",
+    re.IGNORECASE,
+)
+_MUTATE_INTENT_RE = re.compile(
+    r"(?:更新|设置|置|改|设)为"                     # ...为 X (assignment, not 更新"后")
+    r"|恢复.{0,8}(?:状态|为)"                       # 恢复...状态 / 恢复...为
+    r"|归档|解档|下线|上线|停用|启用|禁用|冻结|解冻"   # state toggles (rare in reads)
+    r"|删除用户|移除用户"
+    r"|创建备注|新增备注|添加备注"
+    r"|添加标签|打标签|移除标签|加标签"
+    r"|转移.{0,6}部门|调整.{0,6}部门|调入|调出|批量"
+    r"|\b(?:update|delete|create|restore|archive|transfer|deactivate|activate)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_write_intent(description: str) -> bool:
+    """True when a case acquires a token or issues an imperative state mutation."""
+    text = description or ""
+    return bool(_TOKEN_ACQUIRE_RE.search(text) or _MUTATE_INTENT_RE.search(text))
+
+
 def infer_steps_from_case(case: Dict[str, Any], api_doc: str, auth: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Infer common user-management HTTP steps without a model call.
 
@@ -1627,6 +1684,24 @@ def infer_steps_from_case(case: Dict[str, Any], api_doc: str, auth: Dict[str, An
             "write": True,
             "assert": False,
         }))
+
+    # Write-intent abstention: if none of the explicit write branches above
+    # (batch_status / delete / note / update) produced a step yet the case
+    # clearly MUTATES state (acquires a token or issues an imperative status/
+    # tag/department change), do NOT fall through to the read branches below.
+    # A variant's write endpoint (update-status, restore-status, archive,
+    # tag/add, transfer, ...) is not in the fixed-kind catalogue, so the
+    # fall-through would fire a confident-but-wrong READ (e.g. a detail GET)
+    # that never performs the mutation - the write silently never happens and
+    # every later stateful read (counts, statuses) then mismatches its post-
+    # write assertion and is over-reported as failing, shifting the position-
+    # sensitive failing-ID list and collapsing the ratio score. Abstaining
+    # ([]) hands the case to the model in raw-path mode, which reads the FULL
+    # api_doc and can express the real write endpoint.
+    expected_status = assertion.get("expectedStatus") if isinstance(assertion, dict) else None
+    auth_failure_expected = str(expected_status) in {"401", "403"}
+    if not steps and (_has_write_intent(description) or auth_failure_expected):
+        return []
 
     if _has_any_path(paths, "data.activeCount"):
         endpoint = _endpoint(catalog, "stat_active", "/api/user/stat/active", "GET")

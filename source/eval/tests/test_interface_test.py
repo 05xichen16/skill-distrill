@@ -544,6 +544,69 @@ DELETE /v2/users/{userId}
         self.assertFalse(MOD._is_missing_field_reason("status 200 != expected 404"))
         self.assertFalse(MOD._is_missing_field_reason(""))
 
+    def test_write_intent_discriminates_writes_from_reads(self) -> None:
+        # Imperative mutations / token acquisition are write-intent; a read that
+        # merely MENTIONS a past write (前序更新后 / token 复用 / 写入已生效) is NOT.
+        for write in (
+            "获取 token，将用户 U5001 的状态更新为 inactive；校验更新接口响应。",
+            "获取 token，恢复用户 U5001 的状态为 active；校验响应。",
+            "获取 token，归档用户 U6010；校验归档响应。",
+            "获取 token，为用户 U7010 添加标签 VIP；校验响应。",
+            "获取 token，将用户 U9010 转移到 mobile 部门；校验响应。",
+            "复用上一个 token 再次调用写接口，校验返回 401。",
+        ):
+            self.assertTrue(MOD._has_write_intent(write), write)
+        for read in (
+            "查询用户 U1003 详情；校验前序更新后的邮箱和职级。",
+            "查询用户 U1008 详情；校验前序同 token 复用用例中第一次写入已生效。",
+            "按 status=active、page=1、pageSize=100 查询用户列表；校验分页。",
+            "查询 mobile 部门的活跃用户统计结果。",
+            "查询不存在的用户 U9999 详情；校验异常响应。",
+        ):
+            self.assertFalse(MOD._has_write_intent(read), read)
+
+    def test_unknown_write_endpoint_abstains_not_misroutes(self) -> None:
+        # The core variant fix: a write case whose endpoint is NOT one of the
+        # fixed catalogue kinds (here update-status) must ABSTAIN ([]) so the
+        # model (raw mode) builds the real write. The old code fell through to a
+        # detail GET (data.userId in the assertion), never performing the write,
+        # which cascaded false failures into every dependent stateful read.
+        case = {
+            "id": "W1",
+            "description": "获取 token，将用户 U5001 的状态更新为 inactive；校验更新接口响应。",
+            "assert": {
+                "expectedStatus": 200,
+                "expectedFields": ["code", "data.userId", "data.status"],
+                "expectedValues": {"code": 0, "data.userId": "U5001", "data.status": "inactive"},
+            },
+        }
+        steps = MOD.infer_steps_from_case(case, PUBLIC_API_DOC, MOD.build_auth(AUTH_CONFIG))
+        self.assertEqual(steps, [])
+
+    def test_auth_failure_assertion_abstains(self) -> None:
+        # A case expecting 401/403 exercises the write/token path; it must
+        # abstain rather than fire a read that returns 200.
+        case = {
+            "id": "W2",
+            "description": "复用上一个 token 再次写入用户 U5001，校验鉴权失败。",
+            "assert": {"expectedStatus": 401, "expectedValues": {"code": 40101}},
+        }
+        steps = MOD.infer_steps_from_case(case, PUBLIC_API_DOC, MOD.build_auth(AUTH_CONFIG))
+        self.assertEqual(steps, [])
+
+    def test_read_with_user_id_still_infers_detail(self) -> None:
+        # Guard against over-abstention: a plain read that names a user id must
+        # still resolve to a detail GET (no write-intent present).
+        case = {
+            "id": "R1",
+            "description": "查询用户 U1004 详情；校验职级字段。",
+            "assert": {"expectedValues": {"data.userId": "U1004", "data.title": "Engineer"}},
+        }
+        steps = MOD.infer_steps_from_case(case, PUBLIC_API_DOC, MOD.build_auth(AUTH_CONFIG))
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["path"], "/api/user/detail/U1004")
+        self.assertFalse(steps[0]["write"])
+
 
 # --- a fake in-memory service (the http_request seam) -----------------------
 
@@ -1334,6 +1397,43 @@ class RawModeTest(unittest.TestCase):
         self.assertEqual(len(prompts), 1)
         self.assertIn("Endpoint catalogue", prompts[0])
         self.assertEqual(steps[0]["path"], "/api/user/detail/U1")
+
+    def test_write_intent_uses_raw_mode_even_with_full_catalog(self) -> None:
+        # A write case on a public-style (catalogue-rich) doc must go RAW first,
+        # so a variant write endpoint (here update-status) is expressed by a
+        # documented concrete path instead of being squeezed through a fixed
+        # catalogue kind. One model call; the raw prompt; the write step survives.
+        reply = json.dumps([
+            {"method": "POST", "path": "/api/user/batch-update-status",
+             "body": {"userIds": ["U1"], "status": "inactive"}, "write": True, "assert": True},
+        ])
+        steps, prompts = self._patched_parse(
+            [reply], PUBLIC_API_DOC,
+            description="获取 token，将用户 U1 的状态更新为 inactive；校验更新响应。",
+        )
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("API documentation:", prompts[0])
+        self.assertNotIn("Endpoint catalogue", prompts[0])
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["path"], "/api/user/batch-update-status")
+        self.assertTrue(steps[0]["write"])
+
+    def test_write_intent_raw_falls_back_to_catalog_on_empty(self) -> None:
+        # If the raw reply yields no usable step on a catalogue-rich doc, the
+        # write case still falls through to catalogue mode (public path intact).
+        replies = [
+            json.dumps([{"endpoint_key": "update", "body": {"userId": "U1", "title": "L"}, "assert": True}]),
+            json.dumps([{"endpoint_key": "update", "body": {"userId": "U1", "title": "L"}, "assert": True}]),
+        ]
+        steps, prompts = self._patched_parse(
+            replies, PUBLIC_API_DOC,
+            description="获取 token，更新用户 U1 的职级为 L；校验响应。",
+        )
+        # raw prompt first (empty -> no path), then catalogue prompt resolves it.
+        self.assertIn("API documentation:", prompts[0])
+        self.assertIn("Endpoint catalogue", prompts[-1])
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["path"], "/api/user/update")
 
     def test_raw_mode_drops_invented_paths(self) -> None:
         # A path absent from api_doc is a model invention -> dropped; with no
