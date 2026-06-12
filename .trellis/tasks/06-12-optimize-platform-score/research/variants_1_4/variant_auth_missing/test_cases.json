@@ -1,0 +1,279 @@
+[
+  {
+    "id": "TC001",
+    "description": "获取 token，更新用户 U1003 的邮箱为 u1003.stable@example.com、职级为 Senior Engineer，然后查询 U1003 详情；校验最后一次查询响应。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.userId", "data.email", "data.title"],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1003",
+        "data.email": "u1003.stable@example.com",
+        "data.title": "Senior Engineer"
+      }
+    }
+  },
+  {
+    "id": "TC002",
+    "description": "查询用户 U1003 详情；校验前序更新后的邮箱和职级。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.userId", "data.email", "data.title"],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1003",
+        "data.email": "u1003.stable@example.com",
+        "data.title": "Senior Engineer"
+      }
+    }
+  },
+  {
+    "id": "TC003",
+    "description": "获取 token，更新用户 U1008 的邮箱为 u1008.stable@example.com、职级为 Auth First，然后查询 U1008 详情；校验最后一次查询响应。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.userId", "data.email", "data.title"],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1008",
+        "data.email": "u1008.stable@example.com",
+        "data.title": "Auth First"
+      }
+    }
+  },
+  {
+    "id": "TC004",
+    "description": "再次查询用户 U1008 详情；校验前序更新后的邮箱和职级。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.userId", "data.email", "data.title"],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1008",
+        "data.email": "u1008.stable@example.com",
+        "data.title": "Auth First"
+      }
+    }
+  },
+  {
+    "id": "TC005",
+    "description": "批量将 U3001、U3002 的状态设置为 inactive；校验批量更新接口响应。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.updatedCount", "data.failedCount"],
+      "expectedValues": {
+        "code": 0,
+        "data.updatedCount": 2,
+        "data.failedCount": 0
+      }
+    }
+  },
+  {
+    "id": "TC006",
+    "description": "按 department=platform、page=2、pageSize=2、sortOrder=asc 查询用户列表；校验分页和首条记录。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.page", "data.pageSize", "data.total", "data.list.0.userId", "data.list.0.name"],
+      "expectedValues": {
+        "code": 0,
+        "data.page": 2,
+        "data.pageSize": 2,
+        "data.total": 3,
+        "data.list.0.userId": "U1003",
+        "data.list.0.name": "Carol"
+      }
+    }
+  },
+  {
+    "id": "TC007",
+    "description": "按 status=active、page=1、pageSize=100、sortOrder=asc 查询用户列表；校验分页、总数和第 100 条记录。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.page", "data.pageSize", "data.total", "data.list.0.userId", "data.list.99.userId"],
+      "expectedValues": {
+        "code": 0,
+        "data.page": 1,
+        "data.pageSize": 100,
+        "data.total": 240,
+        "data.list.0.userId": "U2001",
+        "data.list.99.userId": "U2100"
+      }
+    }
+  },
+  {
+    "id": "TC008",
+    "description": "按 keyword=Alice、page=1、pageSize=10 查询用户列表；校验命中数量和首条姓名。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.page", "data.total", "data.list.0.userId", "data.list.0.name"],
+      "expectedValues": {
+        "code": 0,
+        "data.page": 1,
+        "data.total": 1,
+        "data.list.0.userId": "U1001",
+        "data.list.0.name": "Alice"
+      }
+    }
+  },
+  {
+    "id": "TC009",
+    "description": "查询用户 U1010 的详细信息，携带 verbose=true；校验经理信息。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.userId", "data.manager.userId", "data.manager.name"],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1010",
+        "data.manager.userId": "M9001",
+        "data.manager.name": "ManagerA"
+      }
+    }
+  },
+  {
+    "id": "TC010",
+    "description": "查询不存在的用户 U9999 详情；校验异常响应。",
+    "assert": {
+      "expectedStatus": 404,
+      "expectedFields": ["code", "message", "data"],
+      "expectedValues": {
+        "code": 1004,
+        "message": "user not found",
+        "data": null
+      }
+    }
+  },
+  {
+    "id": "TC011",
+    "description": "查询 mobile 部门的活跃用户统计结果。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.department", "data.activeCount"],
+      "expectedValues": {
+        "code": 0,
+        "data.department": "mobile",
+        "data.activeCount": 64
+      }
+    }
+  },
+  {
+    "id": "TC012",
+    "description": "查询 platform 部门的活跃用户统计结果。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.department", "data.activeCount"],
+      "expectedValues": {
+        "code": 0,
+        "data.department": "platform",
+        "data.activeCount": 128
+      }
+    }
+  },
+  {
+    "id": "TC013",
+    "description": "查询用户 U1004 详情；校验基础字段。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.userId", "data.email"],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1004",
+        "data.email": "user1004@example.com"
+      }
+    }
+  },
+  {
+    "id": "TC014",
+    "description": "查询用户 U1004 详情；校验职级字段。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.userId", "data.title"],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1004",
+        "data.title": "Engineer"
+      }
+    }
+  },
+  {
+    "id": "TC015",
+    "description": "按 status=active、page=1、pageSize=5、sortOrder=desc 查询用户列表；校验首条记录。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.page", "data.total", "data.list.0.userId"],
+      "expectedValues": {
+        "code": 0,
+        "data.page": 1,
+        "data.total": 240,
+        "data.list.0.userId": "U2240"
+      }
+    }
+  },
+  {
+    "id": "TC016",
+    "description": "按 status=inactive、page=1、pageSize=5、sortOrder=desc 查询用户列表；校验首条记录。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.page", "data.total", "data.list.0.userId"],
+      "expectedValues": {
+        "code": 0,
+        "data.page": 1,
+        "data.total": 9,
+        "data.list.0.userId": "U9009"
+      }
+    }
+  },
+  {
+    "id": "TC017",
+    "description": "查询用户 U1003 详情；校验前序更新后的邮箱和职级。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.userId", "data.email", "data.title"],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1003",
+        "data.email": "u1003.stable@example.com",
+        "data.title": "Senior Engineer"
+      }
+    }
+  },
+  {
+    "id": "TC018",
+    "description": "查询用户 U1008 详情；校验前序同 token 复用用例中第一次写入已生效。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.userId", "data.email", "data.title"],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1008",
+        "data.email": "u1008.stable@example.com",
+        "data.title": "Auth First"
+      }
+    }
+  },
+  {
+    "id": "TC019",
+    "description": "查询用户 U1005 详情；校验基础职级字段。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.userId", "data.title"],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1005",
+        "data.title": "Engineer"
+      }
+    }
+  },
+  {
+    "id": "TC020",
+    "description": "查询用户 U1005 详情；校验职级字段为 Quality Owner。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": ["code", "data.userId", "data.title"],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1005",
+        "data.title": "Quality Owner"
+      }
+    }
+  }
+]

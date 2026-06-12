@@ -30,6 +30,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -1034,6 +1035,400 @@ class MissingFieldConservatismTest(unittest.TestCase):
         self.assertEqual(result["answer"], "K3")
         self.assertEqual(result["failed"], ["K3"])
         self.assertEqual(result["unjudged"], 1)
+
+
+# --- base-url derivation (the variant moves the service host:port) ----------
+
+class BaseUrlDerivationTest(unittest.TestCase):
+    """auth_config.json is the ONLY authoritative address source and the
+    variant may rename/restructure it, so the base URL is derived through a
+    chain (exact baseUrl -> named variants -> nested URL scan -> host+port)
+    and NEVER hard-coded or defaulted to a fixed address.
+    """
+
+    def test_exact_baseurl_wins_verbatim(self) -> None:
+        # Precedence: the public-set field beats any other URL in the file.
+        auth = MOD.build_auth({
+            "baseUrl": "http://127.0.0.1:18081",
+            "serviceUrl": "http://9.9.9.9:9999",
+        })
+        self.assertEqual(auth["base_url"], "http://127.0.0.1:18081")
+
+    def test_renamed_service_url_field(self) -> None:
+        auth = MOD.build_auth({
+            "serviceUrl": "http://10.20.30.40:19090/",
+            "packageIdHeader": "X-Package-Id",
+            "token": {"endpoint": "/api/auth/token"},
+        })
+        self.assertEqual(auth["base_url"], "http://10.20.30.40:19090")
+
+    def test_snake_case_base_url_field(self) -> None:
+        auth = MOD.build_auth({"base_url": "http://svc.local:8080"})
+        self.assertEqual(auth["base_url"], "http://svc.local:8080")
+
+    def test_named_endpoint_url_uses_authority_only(self) -> None:
+        # A full token-endpoint URL is a clue: its authority is the base, its
+        # path is NOT.
+        auth = MOD.build_auth({
+            "token": {"tokenUrl": "https://10.1.2.3:18443/v2/auth/issue"},
+        })
+        self.assertEqual(auth["base_url"], "https://10.1.2.3:18443")
+
+    def test_nested_url_scan_in_prose(self) -> None:
+        # No URL-named key at all: the recursive scan still finds an absolute
+        # URL embedded in a nested prose string and uses its authority.
+        auth = MOD.build_auth({
+            "notes": {"zh": "请把请求发到 http://10.9.8.7:1234/v1 这个地址"},
+        })
+        self.assertEqual(auth["base_url"], "http://10.9.8.7:1234")
+
+    def test_scan_prefers_most_frequent_authority(self) -> None:
+        auth = MOD.build_auth({
+            "a": ["see http://1.1.1.1:81/x once"],
+            "b": "use http://2.2.2.2:82/y and http://2.2.2.2:82/z",
+        })
+        self.assertEqual(auth["base_url"], "http://2.2.2.2:82")
+
+    def test_host_and_port_declared_separately(self) -> None:
+        auth = MOD.build_auth({
+            "service": {"host": "192.168.3.7", "port": 19090},
+            "token": {"endpoint": "/api/auth/token"},
+        })
+        self.assertEqual(auth["base_url"], "http://192.168.3.7:19090")
+
+    def test_host_with_embedded_port(self) -> None:
+        auth = MOD.build_auth({"serviceAddress": "172.16.0.9:18099"})
+        self.assertEqual(auth["base_url"], "http://172.16.0.9:18099")
+
+    def test_schemeless_baseurl_gets_http_scheme(self) -> None:
+        auth = MOD.build_auth({"baseUrl": "127.0.0.1:18081"})
+        self.assertEqual(auth["base_url"], "http://127.0.0.1:18081")
+
+    def test_no_url_anywhere_yields_empty(self) -> None:
+        # Nothing usable -> "" (answer() then fails fast; no hard-coded
+        # fallback address may ever appear here).
+        auth = MOD.build_auth({
+            "packageIdHeader": "X-Package-Id",
+            "token": {"endpoint": "/api/auth/token", "method": "POST"},
+        })
+        self.assertEqual(auth["base_url"], "")
+
+    def test_key_token_matching_is_word_based(self) -> None:
+        # "description" must not match the host token "ip"; a bare host in a
+        # non-host-named field is not an address declaration.
+        auth = MOD.build_auth({"description": "no address here 1.2.3.4"})
+        self.assertEqual(auth["base_url"], "")
+
+
+class MissingBaseUrlFailFastTest(unittest.TestCase):
+    """No derivable base url -> answer() raises immediately (router falls back
+    to the model loop) instead of warning and burning 20 cases x retries.
+    """
+
+    def setUp(self) -> None:
+        _force_offline_env()
+
+    def tearDown(self) -> None:
+        _force_offline_env()
+
+    def test_answer_raises_and_lists_top_level_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            doc_dir = Path(tmp) / "docs"
+            doc_dir.mkdir()
+            (doc_dir / "test_cases.json").write_bytes(
+                json.dumps([CASES[0]], ensure_ascii=False).encode("utf-8")
+            )
+            (doc_dir / "api_doc.md").write_bytes(b"# api\n")
+            (doc_dir / "auth_config.json").write_bytes(
+                json.dumps({"authMode": "token", "token": {"endpoint": "/auth"}}).encode("utf-8")
+            )
+            args = {
+                "task_description": "verify",
+                "doc_dir": str(doc_dir),
+                "_runtime": {"question_dir": str(doc_dir.parent)},
+            }
+            with self.assertRaises(RuntimeError) as ctx:
+                MOD.answer(args, parser=_fake_parser({}), requester=FakeService())
+        message = str(ctx.exception)
+        self.assertIn("auth_config.json", message)
+        self.assertIn("authMode", message)  # diagnosis lists the top-level keys
+
+
+# --- TCP reachability probe --------------------------------------------------
+
+class ProbeServiceTest(unittest.TestCase):
+    """Fail fast when the auth-config address is dead: one path-free TCP probe
+    before the case loop (variants do not guarantee /health). Probing only
+    happens on a real run (model configured + real HTTP seam), so offline and
+    injected-fake runs keep the legacy conservative behaviour.
+    """
+
+    def setUp(self) -> None:
+        _force_offline_env()
+
+    def tearDown(self) -> None:
+        _force_offline_env()
+
+    def test_probe_failure_reports_target_address(self) -> None:
+        def refuse(address, timeout):
+            raise OSError("connection refused")
+
+        error = MOD.probe_service(
+            "http://10.0.0.9:18099", timeout=0.05, attempts=1, connector=refuse
+        )
+        self.assertIsNotNone(error)
+        self.assertIn("10.0.0.9:18099", error)
+
+    def test_probe_success_returns_none_and_closes(self) -> None:
+        closed: List[bool] = []
+
+        class FakeConn:
+            def close(self) -> None:
+                closed.append(True)
+
+        error = MOD.probe_service(
+            "http://10.0.0.9:18099", connector=lambda address, timeout: FakeConn()
+        )
+        self.assertIsNone(error)
+        self.assertEqual(closed, [True])
+
+    def test_probe_retries_once_then_fails(self) -> None:
+        attempts: List[Any] = []
+
+        def refuse(address, timeout):
+            attempts.append(address)
+            raise OSError("refused")
+
+        error = MOD.probe_service(
+            "http://10.0.0.9:18099", timeout=0.05, attempts=2, connector=refuse
+        )
+        self.assertIsNotNone(error)
+        self.assertEqual(len(attempts), 2)
+
+    def test_unprobeable_base_url_is_an_error(self) -> None:
+        self.assertIsNotNone(MOD.probe_service("not-a-url"))
+
+    def test_answer_raises_when_probe_fails(self) -> None:
+        # Model configured + the REAL http seam (the only probing combination);
+        # probe_service is monkeypatched so no real socket is touched, and the
+        # raise lands BEFORE any case or model call.
+        with tempfile.TemporaryDirectory() as tmp:
+            doc_dir = _write_inputs(Path(tmp), [CASES[0]])
+            _set_fake_config()
+            old_probe = MOD.probe_service
+            MOD.probe_service = (
+                lambda base_url, timeout=3.0, attempts=2, connector=None:
+                "service 127.0.0.1:18081 unreachable (tcp connect failed)"
+            )
+            try:
+                args = {
+                    "task_description": "verify",
+                    "doc_dir": str(doc_dir),
+                    "_runtime": {"question_dir": str(doc_dir.parent)},
+                }
+                with self.assertRaises(RuntimeError) as ctx:
+                    MOD.answer(args, parser=_fake_parser({}))  # default requester
+            finally:
+                MOD.probe_service = old_probe
+        message = str(ctx.exception)
+        self.assertIn("unreachable", message)
+        self.assertIn("127.0.0.1:18081", message)
+
+    def test_probe_skipped_offline_and_with_injected_requester(self) -> None:
+        # config None (offline) -> never probes; the conservative-path answer
+        # is byte-identical to the legacy behaviour.
+        with tempfile.TemporaryDirectory() as tmp:
+            doc_dir = _write_inputs(Path(tmp), CASES)
+            probe_calls: List[str] = []
+            old_probe = MOD.probe_service
+
+            def recording_probe(base_url, timeout=3.0, attempts=2, connector=None):
+                probe_calls.append(base_url)
+                return "boom"
+
+            MOD.probe_service = recording_probe
+            try:
+                args = {
+                    "task_description": "verify",
+                    "doc_dir": str(doc_dir),
+                    "_runtime": {"question_dir": str(doc_dir.parent)},
+                }
+                result = MOD.answer(args, parser=_fake_parser(STEPS_BY_ID), requester=FakeService())
+            finally:
+                MOD.probe_service = old_probe
+        self.assertEqual(probe_calls, [])
+        self.assertEqual(result["answer"], "C2,C4")
+
+
+# --- raw-path mode (catalogue-overfit insurance) ------------------------------
+
+MODEL_CONFIG = {"url": "u", "api_key": "k", "model": "m", "package_id": ""}
+
+SPARSE_API_DOC = """
+### List things
+- Path: `/v9/things`
+- Method: `GET`
+
+### Create thing
+- Path: `/v9/things/create`
+- Method: `POST`
+"""
+
+
+class RawModeTest(unittest.TestCase):
+    """The endpoint catalogue classifies endpoints into FIXED kinds; a variant
+    that renames/adds/removes endpoints defeats it (every endpoint_key resolves
+    empty -> 20/20 unjudgeable). The insurance: a global raw-path mode when the
+    catalogue parses < CATALOG_MIN_ENDPOINTS paths, plus a budgeted per-case
+    raw retry when the model answered but no endpoint_key resolved. Raw paths
+    must be documented in api_doc (template-aware) - no invented URLs.
+    """
+
+    def setUp(self) -> None:
+        MOD._RAW_RETRY_STATE["left"] = MOD.RAW_RETRY_MAX
+        MOD._RAW_RETRY_STATE["deadline"] = None
+
+    def tearDown(self) -> None:
+        MOD._RAW_RETRY_STATE["left"] = MOD.RAW_RETRY_MAX
+        MOD._RAW_RETRY_STATE["deadline"] = None
+
+    def _patched_parse(self, replies: List[str], api_doc: str, description: str = "do it"):
+        prompts: List[str] = []
+
+        def fake_model(config, prompt, timeout):
+            prompts.append(prompt)
+            return replies[min(len(prompts), len(replies)) - 1]
+
+        old_call = MOD._call_model
+        MOD._call_model = fake_model
+        try:
+            steps = MOD.parse_steps(
+                MODEL_CONFIG, description, api_doc, MOD.build_auth(AUTH_CONFIG), 5
+            )
+        finally:
+            MOD._call_model = old_call
+        return steps, prompts
+
+    def test_sparse_catalog_switches_whole_run_to_raw_mode(self) -> None:
+        # The sparse doc yields < 3 catalogue paths -> the prompt is the raw
+        # (full api_doc) shape and steps are parsed without endpoint_key.
+        reply = json.dumps([
+            {"method": "GET", "path": "/v9/things", "query": {"page": 1}, "assert": True},
+        ])
+        steps, prompts = self._patched_parse([reply], SPARSE_API_DOC)
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("API documentation:", prompts[0])
+        self.assertNotIn("Endpoint catalogue", prompts[0])
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["path"], "/v9/things")
+        self.assertEqual(steps[0]["method"], "GET")
+        self.assertTrue(steps[0]["assert"])
+
+    def test_full_catalog_keeps_endpoint_key_mode(self) -> None:
+        # The public-set doc parses enough endpoints -> catalogue mode stays
+        # the primary path (zero behaviour change on the public set).
+        reply = json.dumps([
+            {"endpoint_key": "detail", "path_params": {"userId": "U1"}, "assert": True},
+        ])
+        steps, prompts = self._patched_parse([reply], PUBLIC_API_DOC)
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("Endpoint catalogue", prompts[0])
+        self.assertEqual(steps[0]["path"], "/api/user/detail/U1")
+
+    def test_raw_mode_drops_invented_paths(self) -> None:
+        # A path absent from api_doc is a model invention -> dropped; with no
+        # surviving step the case degrades to the conservative pass.
+        reply = json.dumps([
+            {"method": "GET", "path": "/v9/secret", "assert": True},
+            {"method": "GET", "path": "/v9/things/{thingId}", "assert": True},
+        ])
+        steps, _prompts = self._patched_parse([reply], SPARSE_API_DOC)
+        self.assertEqual(steps, [])
+
+    def test_path_documented_template_matching(self) -> None:
+        self.assertTrue(MOD._path_documented("/api/user/detail/U77", PUBLIC_API_DOC))
+        self.assertTrue(MOD._path_documented("/api/user/search", PUBLIC_API_DOC))
+        self.assertFalse(MOD._path_documented("/api/user/evil/U77", PUBLIC_API_DOC))
+        self.assertFalse(MOD._path_documented("", PUBLIC_API_DOC))
+
+    def test_unresolvable_endpoint_keys_trigger_raw_retry(self) -> None:
+        # Catalogue mode, but the model picked a key the catalogue cannot
+        # resolve (the variant's endpoint kind is not classified) -> ONE raw
+        # retry recovers the case via a documented concrete path.
+        replies = [
+            json.dumps([{"endpoint_key": "mystery_op", "assert": True}]),
+            json.dumps([{"method": "GET", "path": "/api/user/detail/U1", "assert": True}]),
+        ]
+        steps, prompts = self._patched_parse(replies, PUBLIC_API_DOC)
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("Endpoint catalogue", prompts[0])
+        self.assertIn("API documentation:", prompts[1])
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["path"], "/api/user/detail/U1")
+        self.assertEqual(MOD._RAW_RETRY_STATE["left"], MOD.RAW_RETRY_MAX - 1)
+
+    def test_raw_retry_budget_exhausted_abstains(self) -> None:
+        # Budget gone -> no second model call; [] lets the case degrade to the
+        # conservative pass instead of burning more wall clock.
+        MOD._RAW_RETRY_STATE["left"] = 0
+        replies = [
+            json.dumps([{"endpoint_key": "mystery_op", "assert": True}]),
+            json.dumps([{"method": "GET", "path": "/api/user/detail/U1", "assert": True}]),
+        ]
+        steps, prompts = self._patched_parse(replies, PUBLIC_API_DOC)
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(steps, [])
+
+    def test_raw_retry_skipped_near_deadline(self) -> None:
+        # SKILL_BUDGET_SECONDS nearly burnt -> skip the retry (abstain) so the
+        # external kill cannot truncate the answer.
+        MOD._RAW_RETRY_STATE["deadline"] = time.monotonic() + 5  # < RAW_RETRY_MIN_SECONDS
+        replies = [
+            json.dumps([{"endpoint_key": "mystery_op", "assert": True}]),
+            json.dumps([{"method": "GET", "path": "/api/user/detail/U1", "assert": True}]),
+        ]
+        steps, prompts = self._patched_parse(replies, PUBLIC_API_DOC)
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(steps, [])
+
+    def test_raw_step_full_url_reduced_to_documented_path(self) -> None:
+        # A model echoing the full URL (or embedding the query string) is
+        # reduced to the root-relative documented path; the query survives.
+        raw_steps = [
+            {"method": "GET", "path": "http://127.0.0.1:18081/api/user/search?status=active",
+             "assert": True},
+        ]
+        steps = MOD._normalise_raw_steps(raw_steps, PUBLIC_API_DOC)
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["path"], "/api/user/search")
+        self.assertEqual(steps[0]["query"], {"status": "active"})
+
+    def test_raw_step_bare_authority_is_dropped(self) -> None:
+        # The doc's basic-info section quotes the service URL; a step that is
+        # ONLY the authority (no documented path) must still be dropped.
+        steps = MOD._normalise_raw_steps(
+            [{"method": "GET", "path": "http://127.0.0.1:18081", "assert": True}],
+            "service at `http://127.0.0.1:18081`\n### x\n- Path: `/api/user/search`\n",
+        )
+        self.assertEqual(steps, [])
+
+
+PUBLIC_DOC_DIR = REPO_ROOT / "publish" / "publish_V1" / "测试用例接口文档"
+
+
+class PublicSetRegressionGuardTest(unittest.TestCase):
+    """The real public inputs must keep their proven paths: baseUrl read
+    verbatim and the endpoint catalogue complete enough for catalogue mode.
+    """
+
+    @unittest.skipUnless(PUBLIC_DOC_DIR.is_dir(), "public doc dir not present")
+    def test_real_public_inputs_keep_catalog_mode_and_base_url(self) -> None:
+        api_doc = (PUBLIC_DOC_DIR / "api_doc.md").read_text(encoding="utf-8")
+        catalog = MOD.parse_endpoint_catalog(api_doc)
+        self.assertGreaterEqual(MOD._count_catalog_paths(catalog), MOD.CATALOG_MIN_ENDPOINTS)
+        auth_config = json.loads((PUBLIC_DOC_DIR / "auth_config.json").read_text(encoding="utf-8"))
+        auth = MOD.build_auth(auth_config)
+        self.assertEqual(auth["base_url"], auth_config["baseUrl"].rstrip("/"))
 
 
 if __name__ == "__main__":

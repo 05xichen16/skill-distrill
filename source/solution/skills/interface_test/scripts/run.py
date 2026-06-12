@@ -98,6 +98,17 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
         return default
 
 
+def _ascii_safe(value: Any) -> str:
+    """Escape non-ASCII so a raise message survives any stderr pipe codec.
+
+    A localized OS error (e.g. a Chinese WinError text) inside an exception
+    message becomes UTF-8 bytes on stderr that a GBK-decoding parent pipe
+    reader chokes on; backslash-escaping keeps the diagnosis readable and the
+    pipe safe.
+    """
+    return str(value).encode("ascii", "backslashreplace").decode("ascii")
+
+
 # --- directory / file resolution (mirrors spec_qa) -------------------------
 
 def _candidate_paths(name: str, runtime: Dict[str, Any]) -> List[str]:
@@ -207,6 +218,200 @@ def _dig(obj: Any, *keys: str) -> Any:
     return cur
 
 
+# The hidden variant moves the service to a DIFFERENT host:port and may also
+# rename/restructure the auth config ("adjusted auth rules"), so the base URL
+# is derived from auth_config.json content ONLY - never from the question text
+# and never from a hard-coded default address.
+
+_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
+# "http(s)://host[:port]" - whole values AND fragments embedded in prose.
+_URL_IN_TEXT_RE = re.compile(r"(https?)://([A-Za-z0-9.\-]+)(:\d{1,5})?", re.IGNORECASE)
+_BARE_HOST_RE = re.compile(r"[A-Za-z0-9.\-]+(:\d{1,5})?")
+_CAMEL_SPLIT_RE = re.compile(r"([a-z0-9])([A-Z])")
+
+# Key-name tokens that mark a field as URL-ish (step 2 of the derivation) or
+# host-ish (step 4). Matching is on whole camelCase/snake_case tokens so e.g.
+# "description" never matches "ip".
+_NAMED_URL_TOKENS = {"url", "uri", "endpoint", "host", "addr", "address",
+                     "server", "service", "base", "gateway"}
+_HOST_KEY_TOKENS = {"host", "hostname", "ip", "addr", "address"}
+
+
+def _key_tokens(key: Any) -> set:
+    """Split a JSON key (camelCase / snake_case) into lowercase word tokens."""
+    text = _CAMEL_SPLIT_RE.sub(r"\1_\2", str(key or ""))
+    return {token for token in re.split(r"[^A-Za-z0-9]+", text.lower()) if token}
+
+
+def _abs_url_authority(value: Any) -> str:
+    """``scheme://host[:port]`` when *value* is an absolute http(s) URL string."""
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not _SCHEME_RE.match(text):
+        return ""
+    match = _URL_IN_TEXT_RE.match(text)
+    if not match:
+        return ""
+    return "%s://%s%s" % (match.group(1).lower(), match.group(2), match.group(3) or "")
+
+
+def _named_url_from_config(config: Any) -> str:
+    """Step 2: a URL-named field (serviceUrl / base_url / endpoint / ...).
+
+    The value must be an absolute http(s) URL; only its scheme+authority is
+    used (a named field may carry a full endpoint URL such as the token
+    endpoint - its path is not part of the base). Shallower fields win.
+    """
+    candidates: List[Tuple[int, int, str]] = []
+    order = [0]
+
+    def walk(node: Any, depth: int) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(value, str):
+                    if _key_tokens(key) & _NAMED_URL_TOKENS:
+                        authority = _abs_url_authority(value)
+                        if authority:
+                            order[0] += 1
+                            candidates.append((depth, order[0], authority))
+                else:
+                    walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, depth + 1)
+
+    walk(config, 0)
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[0][2]
+
+
+def _scanned_url_from_config(config: Any) -> str:
+    """Step 3: any absolute http(s) URL anywhere in the JSON (authority only).
+
+    Every string value is scanned for embedded ``http(s)://host[:port]``
+    fragments (a full token-endpoint URL counts as a clue). When several
+    distinct authorities appear, the most frequent wins, then the shallowest,
+    then the first seen.
+    """
+    found: Dict[str, List[int]] = {}  # authority -> [count, min_depth, first_order]
+    order = [0]
+
+    def walk(node: Any, depth: int) -> None:
+        if isinstance(node, dict):
+            for value in node.values():
+                walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, depth + 1)
+        elif isinstance(node, str):
+            for match in _URL_IN_TEXT_RE.finditer(node):
+                authority = "%s://%s%s" % (
+                    match.group(1).lower(), match.group(2), match.group(3) or "",
+                )
+                order[0] += 1
+                entry = found.setdefault(authority, [0, depth, order[0]])
+                entry[0] += 1
+                entry[1] = min(entry[1], depth)
+
+    walk(config, 0)
+    if not found:
+        return ""
+    ranked = sorted(found.items(), key=lambda kv: (-kv[1][0], kv[1][1], kv[1][2]))
+    return ranked[0][0]
+
+
+def _host_port_from_config(config: Any) -> str:
+    """Step 4: separately declared host/ip + port fields joined as a base.
+
+    A host-named string that already embeds ":port" is used directly; else a
+    host-named string is paired with a port-named integer, preferring a pair
+    declared in the SAME object, then the shallowest of each. The scheme is
+    plain http (a bare host:port cannot express TLS).
+    """
+    pairs: List[Tuple[int, str]] = []
+    hosts: List[Tuple[int, str]] = []
+    ports: List[Tuple[int, str]] = []
+
+    def walk(node: Any, depth: int) -> None:
+        if isinstance(node, dict):
+            local_host = ""
+            local_port = ""
+            for key, value in node.items():
+                tokens = _key_tokens(key)
+                if tokens & _HOST_KEY_TOKENS and isinstance(value, str):
+                    text = value.strip()
+                    if text and _BARE_HOST_RE.fullmatch(text):
+                        if ":" in text:
+                            pairs.append((depth, "http://" + text))
+                        else:
+                            local_host = local_host or text
+                            hosts.append((depth, text))
+                if "port" in tokens:
+                    port_text = ""
+                    if isinstance(value, bool):
+                        port_text = ""
+                    elif isinstance(value, int):
+                        port_text = str(value)
+                    elif isinstance(value, str) and value.strip().isdigit():
+                        port_text = value.strip()
+                    if port_text and 0 < int(port_text) < 65536:
+                        local_port = local_port or port_text
+                        ports.append((depth, port_text))
+            if local_host and local_port:
+                pairs.append((depth, "http://%s:%s" % (local_host, local_port)))
+            for value in node.values():
+                walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, depth + 1)
+
+    walk(config, 0)
+    if pairs:
+        pairs.sort(key=lambda item: item[0])
+        return pairs[0][1]
+    if hosts and ports:
+        hosts.sort(key=lambda item: item[0])
+        ports.sort(key=lambda item: item[0])
+        return "http://%s:%s" % (hosts[0][1], ports[0][1])
+    return ""
+
+
+def _ensure_scheme(base: str) -> str:
+    """Prepend http:// to a schemeless host[:port] so urllib can call it."""
+    if not base or _SCHEME_RE.match(base):
+        return base
+    if _BARE_HOST_RE.fullmatch(base):
+        return "http://" + base
+    return base
+
+
+def _derive_base_url(config: Dict[str, Any]) -> str:
+    """Derive the service base URL from auth_config.json content ONLY.
+
+    Chain (first hit wins):
+      1. the exact ``baseUrl`` field, verbatim (public-set path - unchanged);
+      2. a URL-named field whose value is an absolute http(s) URL;
+      3. any absolute http(s) URL anywhere in the JSON (authority only);
+      4. separately declared host/ip + port fields -> http://host:port.
+    Returns "" when nothing usable is found (the caller fails fast rather than
+    letting all cases burn their request/retry cost against no address).
+    """
+    exact = config.get("baseUrl")
+    if isinstance(exact, str) and exact.strip():
+        return _ensure_scheme(exact.strip().rstrip("/"))
+    for derived in (
+        _named_url_from_config(config),
+        _scanned_url_from_config(config),
+        _host_port_from_config(config),
+    ):
+        if derived:
+            return derived
+    return ""
+
+
 def build_auth(auth_config: Any, defaults_base_url: str = "") -> Dict[str, Any]:
     """Extract the service contract from auth_config.json (never hard-coded).
 
@@ -214,10 +419,15 @@ def build_auth(auth_config: Any, defaults_base_url: str = "") -> Dict[str, Any]:
     headers, the dotted path to the access token in the token response, and the
     Authorization header format. Sensible structural fallbacks are used only when
     a key is absent, so a malformed/partial config still yields a usable shape
-    rather than crashing.
+    rather than crashing. The base URL is derived through ``_derive_base_url``
+    (exact ``baseUrl`` first, then renamed/nested/host+port forms) because the
+    variant relocates the service and may rename the field; it is NEVER
+    defaulted to a hard-coded address.
     """
     config = auth_config if isinstance(auth_config, dict) else {}
-    base_url = str(config.get("baseUrl") or defaults_base_url or "").rstrip("/")
+    base_url = _derive_base_url(config)
+    if not base_url:
+        base_url = str(defaults_base_url or "").rstrip("/")
     pkg_header = str(config.get("packageIdHeader") or "X-Package-Id")
 
     token = config.get("token") if isinstance(config.get("token"), dict) else {}
@@ -248,6 +458,63 @@ def _format_auth_header(auth_format: str, access_token: str) -> str:
         return auth_format.replace("{accessToken}", access_token)
     # Format string had no placeholder: assume "<prefix> <token>".
     return (auth_format.rstrip() + " " + access_token).strip()
+
+
+def probe_service(
+    base_url: str,
+    timeout: float = 3.0,
+    attempts: int = 2,
+    connector: Optional[Callable[..., Any]] = None,
+) -> Optional[str]:
+    """Light TCP reachability check of the service before running any case.
+
+    Deliberately path-free: a hidden variant does not guarantee any specific
+    HTTP route (``/health`` is a public-set artefact), so reachability is
+    judged at the TCP layer only. The host:port comes from the auth-config
+    derived base_url (never hard-coded). Returns None when reachable, else an
+    error string carrying the probed address, so the caller can fail fast
+    instead of burning the 20-case x model-parse x request-retry wall clock
+    against a dead address. ``connector`` is an injectable seam for offline
+    tests (defaults to ``socket.create_connection``).
+    """
+    import socket
+    import urllib.parse
+
+    if connector is None:
+        connector = socket.create_connection
+
+    try:
+        parsed = urllib.parse.urlparse(base_url or "")
+    except ValueError:
+        parsed = None
+    host = parsed.hostname if parsed is not None else None
+    if not host:
+        return "unprobeable base url %r (no host)" % (base_url,)
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is None:
+        port = 443 if (parsed.scheme or "").lower() == "https" else 80
+
+    last_error = ""
+    for attempt in range(max(1, attempts)):
+        try:
+            connection = connector((host, port), timeout)
+            close = getattr(connection, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except OSError:
+                    pass
+            return None
+        except OSError as exc:
+            last_error = _ascii_safe(str(exc) or exc.__class__.__name__)
+            if attempt + 1 < max(1, attempts):
+                time.sleep(0.5)
+    return "service %s:%s unreachable (tcp connect failed after %d attempt(s): %s)" % (
+        host, port, max(1, attempts), last_error,
+    )
 
 
 # --- dotted-path access + assertions (pure code, grader-facing) -------------
@@ -574,6 +841,188 @@ def build_steps_prompt(description: str, api_doc: str, auth: Dict[str, Any]) -> 
     )
 
 
+# --- raw-path mode (catalogue-overfit insurance) ----------------------------
+# The endpoint catalogue classifies endpoints into a FIXED set of kinds
+# (detail/search/update/...). The question's explanation warns the variant may
+# add/remove endpoints and change paths/methods/params - on such a variant the
+# classifier misses endpoints and every model step resolves to an empty path,
+# which previously collapsed to "20/20 unjudgeable". Raw-path mode restores the
+# pre-catalogue prompt (the model outputs method+path against the FULL api_doc)
+# and validates each path against the doc text, so it generalises without
+# letting the model invent URLs.
+
+CATALOG_MIN_ENDPOINTS = 3   # public set parses 7; below 3 the catalogue is untrusted
+RAW_RETRY_MAX = 8           # whole-run cap on per-case raw-mode retries
+RAW_RETRY_MIN_SECONDS = 20  # skip a retry without at least this much headroom
+DEFAULT_BUDGET_SECONDS = 600  # matches skill.json timeout_seconds
+EMIT_MARGIN_SECONDS = 30    # finish early enough to still emit the answer
+
+# Per-run retry budget + deadline. ``answer`` re-arms it from
+# SKILL_BUDGET_SECONDS (injected by the runtime); module state because the
+# parser seam's signature is fixed (injected fakes must keep working).
+_RAW_RETRY_STATE: Dict[str, Any] = {"left": RAW_RETRY_MAX, "deadline": None}
+
+
+def _reset_raw_retry_state() -> None:
+    """Re-arm the per-run raw-retry budget + deadline (called by ``answer``)."""
+    budget = _env_int("SKILL_BUDGET_SECONDS", DEFAULT_BUDGET_SECONDS, minimum=1)
+    _RAW_RETRY_STATE["left"] = RAW_RETRY_MAX
+    _RAW_RETRY_STATE["deadline"] = time.monotonic() + budget - EMIT_MARGIN_SECONDS
+
+
+def _deadline_near() -> bool:
+    """True when the skill budget is nearly burnt (no room for more retries)."""
+    deadline = _RAW_RETRY_STATE.get("deadline")
+    return deadline is not None and deadline - time.monotonic() < RAW_RETRY_MIN_SECONDS
+
+
+def _raw_retry_allowed() -> bool:
+    """True while the retry budget and the skill deadline both have room."""
+    if int(_RAW_RETRY_STATE.get("left") or 0) <= 0:
+        return False
+    return not _deadline_near()
+
+
+def _consume_raw_retry() -> None:
+    _RAW_RETRY_STATE["left"] = int(_RAW_RETRY_STATE.get("left") or 0) - 1
+
+
+def _clamped_model_timeout(timeout: int) -> int:
+    """Cap a model-call timeout by the time left before the skill deadline."""
+    deadline = _RAW_RETRY_STATE.get("deadline")
+    if deadline is None:
+        return timeout
+    return max(5, min(timeout, int(deadline - time.monotonic())))
+
+
+def _count_catalog_paths(catalog: Dict[str, Dict[str, Any]]) -> int:
+    return sum(1 for endpoint in catalog.values() if (endpoint or {}).get("path"))
+
+
+def build_steps_prompt_raw(description: str, api_doc: str, auth: Dict[str, Any]) -> str:
+    """The raw-path prompt (the pre-catalogue shape): method+path directly.
+
+    The model reads the FULL api_doc and outputs concrete method+path steps;
+    Python then keeps only steps whose path is documented in the doc text (see
+    ``_normalise_raw_steps``), so the model still cannot invent URLs.
+    """
+    schema = (
+        "Output ONLY a JSON array (no prose, no code fence). Each element is one "
+        "HTTP step:\n"
+        '  {"method":"GET|POST|PUT|PATCH|DELETE", "path":"/api/...", '
+        '"query":{...}, "body":{...}, "write":true|false, "assert":true|false, '
+        '"reuse_token":true|false}\n'
+        "Rules:\n"
+        "- Use ONLY endpoints, paths and parameter names that appear in the API "
+        "doc below. Substitute path params (e.g. {userId}) with concrete values "
+        "from the description.\n"
+        "- Put query-string parameters in \"query\" and JSON request bodies in "
+        "\"body\". Omit \"query\"/\"body\" when not needed.\n"
+        "- \"write\": true for endpoints that modify data (they need an auth "
+        "token); false for read-only endpoints.\n"
+        "- \"assert\": true on the ONE step whose response must be checked "
+        "(by default the LAST step the description says to verify). All other "
+        "steps assert:false.\n"
+        "- \"reuse_token\": true ONLY when the description explicitly says to "
+        "reuse a previously issued token (e.g. to test a 401); otherwise false "
+        "(each write step gets a fresh token).\n"
+        "- Keep the steps in the exact order the description performs them."
+    )
+    base_url = auth.get("base_url", "")
+    return (
+        "You translate one test case's natural-language description into ordered "
+        "HTTP steps against a service at %s.\n\n"
+        "Case description:\n%s\n\n"
+        "API documentation:\n%s\n\n"
+        "%s" % (base_url, (description or "").strip(), (api_doc or "").strip(), schema)
+    )
+
+
+# Path-ish tokens in the api_doc text (used to validate raw-mode paths;
+# backticks/quotes/punctuation terminate a token naturally).
+_DOC_PATH_RE = re.compile(r"/[A-Za-z0-9_{}.:\-/]+")
+
+
+def _template_matches(template: str, path: str) -> bool:
+    """True when *path* instantiates *template* segment-by-segment.
+
+    A ``{placeholder}`` template segment matches any non-empty concrete
+    segment; every other segment must match exactly.
+    """
+    template_parts = template.split("/")
+    path_parts = path.split("/")
+    if len(template_parts) != len(path_parts):
+        return False
+    for template_seg, path_seg in zip(template_parts, path_parts):
+        if len(template_seg) > 2 and template_seg.startswith("{") and template_seg.endswith("}"):
+            if not path_seg:
+                return False
+            continue
+        if template_seg != path_seg:
+            return False
+    return True
+
+
+def _path_documented(path: str, api_doc: str) -> bool:
+    """True when a raw model step's path is backed by the api_doc text.
+
+    Exact substring first (the relaxed form of the old exact-catalogue match);
+    otherwise the path may instantiate a documented ``{placeholder}`` template
+    (e.g. ``/api/user/detail/U1`` from ``/api/user/detail/{userId}``).
+    Anything else is treated as a model-invented URL and dropped.
+    """
+    text = api_doc or ""
+    if not path:
+        return False
+    if path in text:
+        return True
+    trimmed = path.rstrip("/")
+    for template in _DOC_PATH_RE.findall(text):
+        if "{" in template and _template_matches(template.rstrip("/"), trimmed):
+            return True
+    return False
+
+
+def _normalise_raw_steps(steps: List[Any], api_doc: str) -> List[Dict[str, Any]]:
+    """Normalise raw-mode model steps, keeping only documented paths.
+
+    A step's path is first reduced to its root-relative form (a model may echo
+    the full URL or embed the query string); the query-string part is merged
+    into the step query. The step is then dropped when the path is empty,
+    still carries an unsubstituted ``{placeholder}``, or does not appear in
+    the api_doc text (template-aware) - so the model can neither invent URLs
+    nor redirect a request at a foreign host. Returning [] lets the case
+    degrade to the conservative pass instead of firing a fabricated request
+    that could over-report an early failure.
+    """
+    import urllib.parse
+
+    result: List[Dict[str, Any]] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        normalised = _normalise_step(step)
+        path = str(normalised.get("path") or "").strip()
+        query_in_path = ""
+        if _SCHEME_RE.match(path):
+            parsed = urllib.parse.urlparse(path)
+            query_in_path = parsed.query
+            path = parsed.path or ""
+        elif "?" in path:
+            path, _, query_in_path = path.partition("?")
+        if query_in_path:
+            merged: Dict[str, Any] = dict(urllib.parse.parse_qsl(query_in_path))
+            merged.update(normalised.get("query") or {})
+            normalised["query"] = merged
+        normalised["path"] = path
+        if not path or "{" in path or "}" in path:
+            continue
+        if not _path_documented(path, api_doc):
+            continue
+        result.append(normalised)
+    return result
+
+
 def parse_steps(
     config: Dict[str, str],
     description: str,
@@ -584,16 +1033,32 @@ def parse_steps(
     """Turn a case description into structured HTTP steps via the model.
 
     This is the single model seam: offline tests monkeypatch it so nothing
-    reaches the gateway at import time. Returns a list of normalised step dicts.
+    reaches the gateway at import time. Two prompting modes:
+
+    * catalogue mode (default, public-set path): the model picks an
+      ``endpoint_key`` from the code-derived catalogue and Python resolves
+      method/path. Used while the catalogue parsed enough endpoints.
+    * raw-path mode: the model outputs method+path against the FULL api_doc.
+      Used for the WHOLE question when the catalogue parsed fewer than
+      CATALOG_MIN_ENDPOINTS paths (a variant restructured the doc beyond the
+      catalogue's fixed kinds), and as a budgeted per-case retry when the
+      model answered but none of its endpoint_keys resolved.
+
     Raises on a model/transport error (the caller handles retries + fallback);
-    returns ``[]`` only when the model produced no parseable steps.
+    returns ``[]`` only when the model produced no usable steps.
     """
+    catalog = parse_endpoint_catalog(api_doc)
+    if _count_catalog_paths(catalog) < CATALOG_MIN_ENDPOINTS:
+        # Global gate: the catalogue's fixed kinds missed most of the variant's
+        # endpoints; constraining the model to it would abstain the whole run.
+        raw = _call_model(config, build_steps_prompt_raw(description, api_doc, auth), timeout)
+        return _normalise_raw_steps(_extract_json_array(raw) or [], api_doc)
+
     prompt = build_steps_prompt(description, api_doc, auth)
     raw = _call_model(config, prompt, timeout)
     steps = _extract_json_array(raw)
     if not steps:
         return []
-    catalog = parse_endpoint_catalog(api_doc)
     result: List[Dict[str, Any]] = []
     for step in steps:
         if not isinstance(step, dict):
@@ -601,7 +1066,21 @@ def parse_steps(
         normalised = _normalise_model_step(step, catalog)
         if normalised.get("path"):
             result.append(normalised)
-    return result
+    if result:
+        return result
+    # Per-case fallback: the model DID emit steps but no endpoint_key resolved
+    # (the catalogue's kinds missed this case's endpoint). Retry once in
+    # raw-path mode, under a whole-run budget and the skill deadline so the
+    # retries cannot blow the SKILL_BUDGET_SECONDS wall clock.
+    if not _raw_retry_allowed():
+        return []
+    _consume_raw_retry()
+    raw = _call_model(
+        config,
+        build_steps_prompt_raw(description, api_doc, auth),
+        _clamped_model_timeout(timeout),
+    )
+    return _normalise_raw_steps(_extract_json_array(raw) or [], api_doc)
 
 
 _ENDPOINT_KEY_ALIASES = {
@@ -1292,7 +1771,13 @@ def _maybe_json(raw: str) -> Any:
 def _build_url(base_url: str, path: str, query: Dict[str, Any]) -> str:
     import urllib.parse
 
-    full = (base_url or "").rstrip("/") + "/" + str(path or "").lstrip("/")
+    path_text = str(path or "").strip()
+    if _SCHEME_RE.match(path_text):
+        # An auth-config variant may declare the token endpoint as a FULL url;
+        # use it verbatim instead of gluing it behind the base.
+        full = path_text.rstrip("/") or path_text
+    else:
+        full = (base_url or "").rstrip("/") + "/" + path_text.lstrip("/")
     if query:
         # Stringify values; drop None so an absent optional param is not sent.
         pairs = [(k, _qs_value(v)) for k, v in query.items() if v is not None]
@@ -1465,12 +1950,18 @@ def _verify_one(
         except Exception as exc:  # noqa: BLE001 - model/transport error
             last_error = str(exc)
             steps = []
+            if _deadline_near():
+                break  # budget nearly burnt: degrade now, do not risk the kill
             if attempt + 1 < max(1, retries):
                 time.sleep(min(8.0, 0.5 * (2 ** attempt)))
             continue
         if steps:
             break
-        # Model answered but produced no parseable steps; retry the seam.
+        # Model answered but produced no parseable steps; retry the seam -
+        # unless the skill budget is nearly burnt (conservative degrade beats
+        # the external kill that would lose the whole answer).
+        if _deadline_near():
+            break
         if attempt + 1 < max(1, retries):
             time.sleep(min(8.0, 0.5 * (2 ** attempt)))
 
@@ -1521,6 +2012,7 @@ def answer(
         raise ValueError("task_description is required")
 
     warnings: List[str] = []
+    _reset_raw_retry_state()
 
     # Default input folder name: "ce shi yong li jie kou wen dang"
     # (test-case interface docs). Built from codepoints so the source stays
@@ -1544,15 +2036,41 @@ def answer(
     if not api_doc:
         warnings.append("api_doc.md not found under %s; step parsing has no endpoint reference" % doc_dir)
 
-    auth = build_auth(_load_json_file(auth_path))
+    auth_raw = _load_json_file(auth_path)
+    auth = build_auth(auth_raw)
     if not auth["base_url"]:
-        warnings.append("no baseUrl in auth_config.json; service calls will likely fail (cases pass conservatively)")
+        # The variant moves the service address and auth_config.json is the
+        # ONLY authoritative source (nothing may be hard-coded as a fallback).
+        # Without a derivable address every case would burn its full
+        # parse+request+retry cost and still be unjudgeable, so fail fast and
+        # let the router fall back to the model loop instead.
+        if isinstance(auth_raw, dict):
+            detail = "top-level keys: %s" % sorted(_ascii_safe(key) for key in auth_raw.keys())
+        else:
+            detail = "auth_config.json missing or not a JSON object"
+        raise RuntimeError(
+            "no service base url derivable from auth_config.json (%s; scanned "
+            "named url fields, nested absolute http(s) urls and host/port "
+            "pairs - nothing usable); failing fast for the router fallback" % detail
+        )
 
     config = _model_config()
     if config is None:
         warnings.append(
             "model gateway not configured (MODEL_* env missing); cases cannot be judged -> none reported as failing"
         )
+
+    # Reachability fail-fast: one cheap TCP probe of the auth-config address
+    # before the 20-case loop (path-free; variants do not guarantee /health).
+    # Only for a real run (model configured AND the real HTTP seam): offline /
+    # no-model runs keep the legacy conservative path, and an injected fake
+    # requester has no real socket to probe.
+    if config is not None and requester is http_request:
+        probe_error = probe_service(auth["base_url"])
+        if probe_error:
+            raise RuntimeError(
+                "service unreachable, failing fast before running cases: %s" % probe_error
+            )
 
     # Same package id for the whole run (service keeps runtime state per id).
     package_id = ""
@@ -1598,7 +2116,7 @@ def answer(
     if cases and config is not None and unjudged * 3 > len(cases):
         raise RuntimeError(
             "degraded output: %d/%d cases unjudgeable (parse/service failures); %s"
-            % (unjudged, len(cases), "; ".join(warnings[-3:]))
+            % (unjudged, len(cases), _ascii_safe("; ".join(warnings[-3:])))
         )
 
     # Failing IDs joined by code, in test_cases file order (position-sensitive).
