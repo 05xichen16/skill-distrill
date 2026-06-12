@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import io
 import json
 import os
 import re
@@ -56,21 +57,300 @@ def _emit(payload: Dict[str, Any]) -> None:
     buffer.flush()
 
 
+def _decode_bytes(raw: bytes) -> str:
+    """utf-8-sig first (public set), GBK second (variant tolerance), then replace."""
+    for encoding in ("utf-8-sig", "gbk"):
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def read_csv(path: str) -> List[Dict[str, str]]:
-    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
-        return [dict(row) for row in csv.DictReader(handle)]
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    return [dict(row) for row in csv.DictReader(io.StringIO(_decode_bytes(raw), newline=""))]
 
 
 def read_text(path: str) -> str:
     with open(path, "rb") as handle:
         raw = handle.read()
+    return _decode_bytes(raw)
+
+
+# --- attachment-content table discovery ---------------------------------------
+#
+# The question's `files` field only declares the DIRECTORY; every filename and
+# every column header inside it belongs to the variant-mutable zone. A hidden
+# variant that renames csv files used to kill the exact-name sentinel
+# (`purchase_orders_raw.csv`) with exit 1 -> model-loop fallback. Discovery is
+# name-first (public-set behaviour stays byte-identical), content-second:
+# classify each *.csv by header features (per-table alias sets + a scoring
+# vote; ties or all-zero scores abstain).
+
+TABLE_PO = "purchase_orders"
+TABLE_QUERIES = "queries"
+TABLE_VENDORS = "vendors"
+TABLE_TAXONOMY = "category_taxonomy"
+TABLE_MANIFEST = "attachment_manifest"
+
+ALL_TABLES = (TABLE_PO, TABLE_QUERIES, TABLE_VENDORS, TABLE_TAXONOMY, TABLE_MANIFEST)
+
+EXACT_TABLE_FILENAMES = {
+    TABLE_PO: "purchase_orders_raw.csv",
+    TABLE_QUERIES: "queries.csv",
+    TABLE_VENDORS: "vendors.csv",
+    TABLE_TAXONOMY: "category_taxonomy.csv",
+    TABLE_MANIFEST: "attachment_manifest.csv",
+}
+
+# canonical column -> loose aliases. Compared after _norm_col on both sides, so
+# spacing / case / underscore variants collapse ("PO No" == "po_no").
+TABLE_COLUMN_ALIASES: Dict[str, Dict[str, List[str]]] = {
+    TABLE_PO: {
+        "po_id": [
+            "po_id", "po_no", "po_number", "po_code", "order_id", "order_no",
+            "purchase_order_id", "purchase_id", "采购单号", "采购单编号",
+            "采购订单号", "订单编号", "订单号", "po编号", "单据编号",
+        ],
+        "vendor_id": [
+            "vendor_id", "vendor_code", "supplier_id", "supplier_code",
+            "供应商id", "供应商编码", "供应商编号", "供应商代码",
+        ],
+        "vendor_name_raw": [
+            "vendor_name_raw", "vendor_name", "supplier_name", "供应商名称", "录入供应商",
+        ],
+        "category_code": [
+            "category_code", "category_id", "cat_code", "品类编码", "品类代码",
+            "类别编码", "类别代码",
+        ],
+        "business_purpose": [
+            "business_purpose", "purpose", "业务用途", "采购用途", "用途", "用途说明",
+        ],
+        "item_description": [
+            "item_description", "item_desc", "description", "物品描述", "采购内容",
+            "品名", "项目描述", "采购描述", "描述",
+        ],
+        "amount_raw": [
+            "amount_raw", "raw_amount", "amount", "total_amount", "金额",
+            "录入金额", "采购金额", "含税金额", "总金额",
+        ],
+        "currency": ["currency", "currency_code", "ccy", "币种", "货币", "货币类型"],
+        "created_at": [
+            "created_at", "create_date", "created_date", "po_date", "order_date",
+            "创建日期", "创建时间", "下单日期", "日期",
+        ],
+        "attachment_ids": [
+            "attachment_ids", "attachment_id_list", "attachment_list", "attachments",
+            "附件", "附件id", "附件编号", "附件列表",
+        ],
+    },
+    TABLE_QUERIES: {
+        "query_id": [
+            "query_id", "query_no", "qid", "查询id", "查询编号", "询问编号", "问题编号", "问题id",
+        ],
+        "vendor_id": [
+            "vendor_id", "vendor_code", "supplier_id", "supplier_code",
+            "供应商id", "供应商编码", "供应商编号", "供应商代码",
+        ],
+        "category_code": [
+            "category_code", "category_id", "cat_code", "品类编码", "品类代码",
+            "类别编码", "类别代码",
+        ],
+        "year": ["year", "年份", "年度"],
+        "currency": ["currency", "currency_code", "ccy", "币种", "货币", "货币类型"],
+        "amount_raw": ["amount_raw", "raw_amount", "amount", "金额", "总金额"],
+    },
+    TABLE_VENDORS: {
+        "vendor_id": [
+            "vendor_id", "vendor_code", "supplier_id", "supplier_code",
+            "供应商id", "供应商编码", "供应商编号", "供应商代码",
+        ],
+        "legal_name": [
+            "legal_name", "legal_entity", "company_name", "法定名称", "公司名称",
+            "企业名称", "法人名称", "注册名称", "供应商法定名称",
+        ],
+        "tax_id": [
+            "tax_id", "tax_no", "uscc", "credit_code", "税号", "统一社会信用代码",
+            "信用代码", "纳税人识别号",
+        ],
+        "business_scope": ["business_scope", "scope", "经营范围", "业务范围"],
+        "brand_name": ["brand_name", "brand", "品牌", "品牌名称", "简称"],
+        "city": ["city", "城市", "所在城市"],
+        "po_id": ["po_id", "po_no", "采购单号", "订单编号"],
+        "query_id": ["query_id", "查询id", "查询编号"],
+        "amount_raw": ["amount_raw", "amount", "金额", "总金额"],
+    },
+    TABLE_TAXONOMY: {
+        "category_code": [
+            "category_code", "category_id", "cat_code", "品类编码", "品类代码",
+            "类别编码", "类别代码",
+        ],
+        "category_name": ["category_name", "name", "品类名称", "类别名称"],
+        "definition": ["definition", "定义", "说明"],
+        "boundary_note": ["boundary_note", "边界说明", "备注"],
+        "po_id": ["po_id", "po_no", "采购单号", "订单编号"],
+        "vendor_id": ["vendor_id", "supplier_id", "供应商id", "供应商编码"],
+        "amount_raw": ["amount_raw", "amount", "金额", "总金额"],
+    },
+    TABLE_MANIFEST: {
+        "attachment_id": ["attachment_id", "att_id", "附件id", "附件编号"],
+        "po_id": [
+            "po_id", "po_no", "po_number", "order_id", "采购单号", "采购单编号",
+            "订单编号", "po编号",
+        ],
+        "attachment_type": [
+            "attachment_type", "type", "kind", "file_type", "附件类型", "类型",
+        ],
+        "file_path": [
+            "file_path", "filepath", "path", "file", "file_name", "文件路径", "路径", "文件",
+        ],
+        "evidence_id": ["evidence_id", "证据id", "证据编号"],
+        "amount_raw": ["amount_raw", "amount", "金额", "总金额"],
+    },
+}
+
+# Signature gates per table. "required": every group must hit at least one of
+# its canonical columns; "forbidden": any hit zeroes the score. Score itself is
+# the number of distinct canonical columns matched (most hits win; ties abstain).
+TABLE_SIGNATURES: Dict[str, Dict[str, Any]] = {
+    TABLE_PO: {
+        "required": [["po_id"], ["amount_raw"], ["vendor_id", "vendor_name_raw"]],
+        "forbidden": [],
+    },
+    TABLE_QUERIES: {"required": [["query_id"]], "forbidden": ["amount_raw"]},
+    TABLE_VENDORS: {
+        "required": [["vendor_id"]],
+        "forbidden": ["amount_raw", "po_id", "query_id"],
+    },
+    TABLE_TAXONOMY: {
+        "required": [["category_code"]],
+        "forbidden": ["po_id", "vendor_id", "amount_raw"],
+    },
+    TABLE_MANIFEST: {
+        "required": [["attachment_id"], ["file_path"]],
+        "forbidden": ["amount_raw"],
+    },
+}
+
+_NORMALIZED_ALIAS_CACHE: Dict[str, Dict[str, str]] = {}
+
+
+def _norm_col(name: str) -> str:
+    return re.sub(r"[\s_\-\"']+", "", (name or "").strip().lower())
+
+
+def _alias_lookup(table: str) -> Dict[str, str]:
+    cached = _NORMALIZED_ALIAS_CACHE.get(table)
+    if cached is not None:
+        return cached
+    lookup: Dict[str, str] = {}
+    for canonical, aliases in (TABLE_COLUMN_ALIASES.get(table) or {}).items():
+        for alias in aliases:
+            lookup.setdefault(_norm_col(alias), canonical)
+    _NORMALIZED_ALIAS_CACHE[table] = lookup
+    return lookup
+
+
+def _canonical_column(table: str, header: str) -> Optional[str]:
+    return _alias_lookup(table).get(_norm_col(header))
+
+
+def _matched_canonicals(table: str, headers: List[str]) -> set:
+    matched = set()
+    for header in headers:
+        canonical = _canonical_column(table, header)
+        if canonical:
+            matched.add(canonical)
+    return matched
+
+
+def _table_score(table: str, headers: List[str]) -> int:
+    """Header-feature score for one csv against one table signature; 0 = no."""
+    matched = _matched_canonicals(table, headers)
+    signature = TABLE_SIGNATURES[table]
+    for column in signature["forbidden"]:
+        if column in matched:
+            return 0
+    for group in signature["required"]:
+        if not any(column in matched for column in group):
+            return 0
+    return len(matched)
+
+
+def _sniff_headers(path: str) -> List[str]:
+    """First csv row of a file, decoded tolerantly. [] on any failure."""
     try:
-        return raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return raw.decode("utf-8", errors="replace")
+        with open(path, "rb") as handle:
+            raw = handle.read(65536)
+    except OSError:
+        return []
+    text = _decode_bytes(raw)
+    first_line = text.splitlines()[0] if text.strip() else ""
+    if not first_line:
+        return []
+    try:
+        row = next(csv.reader(io.StringIO(first_line)))
+    except (StopIteration, csv.Error):
+        return []
+    return [cell.strip() for cell in row]
 
 
-def resolve_source_dir(name: str, runtime: Dict[str, Any]) -> str:
+def _scan_csv_files(root: str, max_depth: int = 2, cap: int = 200) -> List[str]:
+    results: List[str] = []
+    root = os.path.abspath(root)
+    base_depth = root.rstrip(os.sep).count(os.sep)
+    for current, dirs, files in os.walk(root):
+        dirs.sort()
+        if current.rstrip(os.sep).count(os.sep) - base_depth >= max_depth:
+            dirs[:] = []
+        for name in sorted(files):
+            if name.lower().endswith(".csv"):
+                results.append(os.path.join(current, name))
+                if len(results) >= cap:
+                    return results
+    return results
+
+
+def discover_tables(
+    csv_paths: List[str],
+    sniffed: Dict[str, List[str]],
+    wanted: Tuple[str, ...] = ALL_TABLES,
+    used: Optional[set] = None,
+) -> Dict[str, str]:
+    """Assign csv files to table roles by header score. Highest score wins its
+    role; a within-role tie abstains (better to fail loudly than guess); each
+    file serves at most one role."""
+    assigned: Dict[str, str] = {}
+    taken = set(used or ())
+    while True:
+        round_best: List[Tuple[int, int, str, str]] = []
+        for table in wanted:
+            if table in assigned:
+                continue
+            scored = [
+                (_table_score(table, sniffed.get(path) or []), path)
+                for path in csv_paths
+                if path not in taken
+            ]
+            scored = [(score, path) for score, path in scored if score > 0]
+            if not scored:
+                continue
+            top = max(score for score, _ in scored)
+            top_paths = [path for score, path in scored if score == top]
+            if len(top_paths) != 1:
+                continue  # ambiguous this round; an exclusivity win may break it later
+            round_best.append((top, wanted.index(table), table, top_paths[0]))
+        if not round_best:
+            return assigned
+        round_best.sort(key=lambda item: (-item[0], item[1]))
+        _, _, table, path = round_best[0]
+        assigned[table] = path
+        taken.add(path)
+
+
+def _candidate_source_dirs(name: str, runtime: Dict[str, Any]) -> List[str]:
     candidates: List[str] = []
     if name:
         if os.path.isabs(name):
@@ -83,10 +363,93 @@ def resolve_source_dir(name: str, runtime: Dict[str, Any]) -> str:
     for path in runtime.get("allowed_file_paths") or []:
         text = str(path)
         candidates.append(text if os.path.isdir(text) else os.path.dirname(text))
+    question_dir = str(runtime.get("question_dir") or "").strip()
+    if question_dir:
+        candidates.append(question_dir)
+    seen = set()
+    result: List[str] = []
     for candidate in candidates:
-        if candidate and os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, "purchase_orders_raw.csv")):
-            return candidate
-    raise FileNotFoundError("purchase source directory not found")
+        if not candidate:
+            continue
+        key = os.path.normcase(os.path.abspath(candidate))
+        if key in seen:
+            continue
+        seen.add(key)
+        if os.path.isdir(candidate):
+            result.append(candidate)
+    return result
+
+
+def _scan_summary(sniffed: Dict[str, List[str]], limit: int = 12) -> str:
+    parts: List[str] = []
+    for path in list(sniffed)[:limit]:
+        headers = "|".join(sniffed[path][:8])
+        parts.append("%s[%s]" % (os.path.basename(path), headers[:120]))
+    if len(sniffed) > limit:
+        parts.append("...(+%d more)" % (len(sniffed) - limit))
+    return "; ".join(parts) or "no csv files found"
+
+
+def resolve_source_tables(
+    name: str, runtime: Dict[str, Any]
+) -> Tuple[str, Dict[str, str], Dict[str, List[str]]]:
+    """Locate the source dir and map table roles to csv paths.
+
+    Exact public filenames take absolute priority (byte-identical public-set
+    behaviour); content discovery only fills the gaps. Returns
+    (source_dir, {table: path}, sniffed_headers_for_diagnostics).
+    """
+    candidates = _candidate_source_dirs(name, runtime)
+    all_sniffed: Dict[str, List[str]] = {}
+
+    # Pass 1: the exact-name sentinel, exactly as before this change.
+    for directory in candidates:
+        if not os.path.isfile(os.path.join(directory, EXACT_TABLE_FILENAMES[TABLE_PO])):
+            continue
+        tables: Dict[str, str] = {}
+        for table, filename in EXACT_TABLE_FILENAMES.items():
+            path = os.path.join(directory, filename)
+            if os.path.isfile(path):
+                tables[table] = path
+        missing = tuple(table for table in ALL_TABLES if table not in tables)
+        if missing:  # partial rename: content-discover only the missing roles
+            csv_paths = _scan_csv_files(directory)
+            sniffed = {path: _sniff_headers(path) for path in csv_paths}
+            all_sniffed.update(sniffed)
+            tables.update(
+                discover_tables(csv_paths, sniffed, missing, used=set(tables.values()))
+            )
+        return directory, tables, all_sniffed
+
+    # Pass 2: full content discovery per candidate directory.
+    for directory in candidates:
+        csv_paths = _scan_csv_files(directory)
+        if not csv_paths:
+            continue
+        sniffed = {path: _sniff_headers(path) for path in csv_paths}
+        all_sniffed.update(sniffed)
+        tables = discover_tables(csv_paths, sniffed)
+        if TABLE_PO in tables:
+            return directory, tables, all_sniffed
+
+    raise FileNotFoundError(
+        "purchase source directory not found; scanned csvs: %s" % _scan_summary(all_sniffed)
+    )
+
+
+def _normalize_columns(rows: List[Dict[str, str]], table: str) -> List[Dict[str, str]]:
+    """Inject canonical column keys for recognised aliases. Existing canonical
+    keys are never overwritten, so public-set rows pass through unchanged."""
+    for row in rows:
+        for header in list(row.keys()):
+            canonical = _canonical_column(table, header)
+            if canonical and canonical not in row:
+                row[canonical] = row[header]
+    return rows
+
+
+def _load_table(path: str, table: str) -> List[Dict[str, str]]:
+    return _normalize_columns(read_csv(path), table)
 
 
 def parse_amount(text: str) -> Optional[int]:
@@ -215,7 +578,8 @@ def load_evidence_texts(
     ocr_reader: Callable[[str], str],
 ) -> List[Dict[str, str]]:
     result: List[Dict[str, str]] = []
-    for attachment_id in [part.strip() for part in (po.get("attachment_ids") or "").split(";") if part.strip()]:
+    id_text = po.get("attachment_ids") or ""
+    for attachment_id in [part.strip() for part in re.split(r"[;,、\s]+", id_text) if part.strip()]:
         row = manifest_by_id.get(attachment_id)
         if not row:
             continue
@@ -325,9 +689,10 @@ def clean_po(
     do_ocr: bool,
     ocr_reader: Callable[[str], str],
 ) -> Optional[Tuple[str, str, int]]:
+    po_id = str(po.get("po_id") or "")
     evidence = load_evidence_texts(source_dir, po, manifest_by_id, do_ocr, ocr_reader)
-    invoices = [parsed for item in evidence for parsed in [parse_invoice(item["text"], po["po_id"])] if parsed]
-    contracts = [parsed for item in evidence for parsed in [parse_contract(item["text"], po["po_id"])] if parsed]
+    invoices = [parsed for item in evidence for parsed in [parse_invoice(item["text"], po_id)] if parsed]
+    contracts = [parsed for item in evidence for parsed in [parse_contract(item["text"], po_id)] if parsed]
 
     vendor = None
     for invoice in invoices:
@@ -537,17 +902,49 @@ def answer(
     ocr_reader: Callable[[str], str] = ocr_image_text,
 ) -> Dict[str, Any]:
     runtime = args.get("_runtime") if isinstance(args.get("_runtime"), dict) else {}
-    source_dir = resolve_source_dir(str(args.get("source_dir") or ""), runtime)
+    source_dir, tables, sniffed = resolve_source_tables(str(args.get("source_dir") or ""), runtime)
     task_description = str(args.get("task_description") or "")
     do_ocr = args.get("do_ocr", True)
     if not isinstance(do_ocr, bool):
         do_ocr = str(do_ocr).strip().lower() not in {"0", "false", "no", "off", ""}
 
-    pos = read_csv(os.path.join(source_dir, "purchase_orders_raw.csv"))
-    queries = read_csv(os.path.join(source_dir, "queries.csv"))
-    vendors = {row["vendor_id"]: row for row in read_csv(os.path.join(source_dir, "vendors.csv"))}
-    valid_categories = {row["category_code"] for row in read_csv(os.path.join(source_dir, "category_taxonomy.csv"))}
-    manifest_by_id = {row["attachment_id"]: row for row in read_csv(os.path.join(source_dir, "attachment_manifest.csv"))}
+    missing = [t for t in (TABLE_QUERIES, TABLE_VENDORS, TABLE_TAXONOMY) if t not in tables]
+    if missing:
+        raise FileNotFoundError(
+            "purchase tables not identified: %s; scanned csvs: %s"
+            % (",".join(missing), _scan_summary(sniffed or {p: _sniff_headers(p) for p in _scan_csv_files(source_dir)}))
+        )
+
+    pos = _load_table(tables[TABLE_PO], TABLE_PO)
+    queries = _load_table(tables[TABLE_QUERIES], TABLE_QUERIES)
+    vendors = {
+        str(row.get("vendor_id") or ""): row
+        for row in _load_table(tables[TABLE_VENDORS], TABLE_VENDORS)
+        if str(row.get("vendor_id") or "").strip()
+    }
+    valid_categories = {
+        str(row.get("category_code") or "")
+        for row in _load_table(tables[TABLE_TAXONOMY], TABLE_TAXONOMY)
+        if str(row.get("category_code") or "").strip()
+    }
+    # Manifest is optional evidence plumbing: degrade to empty instead of crashing.
+    manifest_by_id: Dict[str, Dict[str, str]] = {}
+    if TABLE_MANIFEST in tables:
+        manifest_by_id = {
+            str(row.get("attachment_id") or ""): row
+            for row in _load_table(tables[TABLE_MANIFEST], TABLE_MANIFEST)
+            if str(row.get("attachment_id") or "").strip()
+        }
+
+    # Variant shape fallback: when the PO table carries no attachment-id column
+    # at all, rebuild the join from the manifest's po_id column. Provably a
+    # no-op on the public set (the column exists there on every row).
+    if pos and all("attachment_ids" not in po for po in pos):
+        ids_by_po: Dict[str, List[str]] = defaultdict(list)
+        for attachment_id, row in manifest_by_id.items():
+            ids_by_po[str(row.get("po_id") or "")].append(attachment_id)
+        for po in pos:
+            po["attachment_ids"] = ";".join(ids_by_po.get(str(po.get("po_id") or ""), []))
 
     totals: Dict[Tuple[str, str], int] = defaultdict(int)
     included: List[str] = []
