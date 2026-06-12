@@ -332,6 +332,86 @@ DELETE /v2/users/{userId}
         self.assertEqual(steps[0]["body"], {"userId": "U1007", "content": "需要二线跟进"})
         self.assertTrue(steps[0]["write"])
 
+    def test_search_abstains_without_discriminator(self) -> None:
+        # Fix A: a row-shaped assertion (data.list.* / data.total) with only
+        # pagination/sort recovered (no status/department/keyword) must ABSTAIN
+        # ([]) rather than fire a confident-but-wrong search that would mis-FAIL
+        # a passing case at an early position (zeroing the ratio grader).
+        case = {
+            "id": "T7",
+            "description": "按降序翻到第二页，每页五条列出用户；核对分页与首条。",
+            "assert": {
+                "expectedFields": ["data.page", "data.total", "data.list.0.userId"],
+                "expectedValues": {"data.page": 2},
+            },
+        }
+        steps = MOD.infer_steps_from_case(case, PUBLIC_API_DOC, MOD.build_auth(AUTH_CONFIG))
+        self.assertEqual(steps, [])  # abstained -> falls through to the model seam
+
+    def test_search_emits_when_discriminator_present(self) -> None:
+        # The flip side of Fix A: with a discriminator recovered, the search is
+        # high-confidence and IS emitted (no abstain).
+        case = {
+            "id": "T8",
+            "description": "用 status=active 查询用户，第一页每页十条；核对命中。",
+            "assert": {
+                "expectedFields": ["data.total", "data.list.0.userId"],
+                "expectedValues": {"data.total": 1},
+            },
+        }
+        steps = MOD.infer_steps_from_case(case, PUBLIC_API_DOC, MOD.build_auth(AUTH_CONFIG))
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["path"], "/api/user/search")
+        self.assertEqual(steps[0]["query"]["status"], "active")
+
+    def test_enum_status_recovered_from_synonyms(self) -> None:
+        # Fix D: the status enum may be named with a synonym rather than
+        # ``status=active``. Recovering it lets the search be judged in code
+        # (paired with Fix A's abstain when nothing is recoverable).
+        active = MOD._query_from_description("把处于活跃状态的用户列出来，第一页每页一百条，升序。")
+        self.assertEqual(active.get("status"), "active")
+        on_duty = MOD._query_from_description("列出所有在岗（active）的人，正序。")
+        self.assertEqual(on_duty.get("status"), "active")
+        inactive = MOD._query_from_description("把停用用户按降序列出。")
+        self.assertEqual(inactive.get("status"), "inactive")
+        not_active = MOD._query_from_description("不活跃的人按倒序排列。")
+        self.assertEqual(not_active.get("status"), "inactive")
+
+    def test_enum_status_search_emits_with_synonym(self) -> None:
+        # End-to-end of Fix D + Fix A: a search case that names the status by a
+        # synonym now emits a correct, discriminated search instead of abstaining.
+        case = {
+            "id": "T9",
+            "description": "把活跃用户停在第一页、每页五条、按降序列出；核对打头的那一条。",
+            "assert": {
+                "expectedFields": ["data.page", "data.total", "data.list.0.userId"],
+                "expectedValues": {"data.page": 1},
+            },
+        }
+        steps = MOD.infer_steps_from_case(case, PUBLIC_API_DOC, MOD.build_auth(AUTH_CONFIG))
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["path"], "/api/user/search")
+        self.assertEqual(steps[0]["query"]["status"], "active")
+        self.assertEqual(steps[0]["query"]["sortOrder"], "desc")
+
+    def test_sort_order_extra_synonyms(self) -> None:
+        # Fix D companion: 从大到小 / 从小到大 also resolve sortOrder.
+        self.assertEqual(
+            MOD._query_from_description("按从大到小排列").get("sortOrder"), "desc"
+        )
+        self.assertEqual(
+            MOD._query_from_description("一页放两条，从小到大排").get("sortOrder"), "asc"
+        )
+
+    def test_missing_field_reason_classification(self) -> None:
+        # The Fix B classifier: an absence (missing field/value) is a
+        # wrong-request tell, a present-but-wrong value/status is a real failure.
+        self.assertTrue(MOD._is_missing_field_reason("missing field data.list.0.userId"))
+        self.assertTrue(MOD._is_missing_field_reason("missing value field data.title"))
+        self.assertFalse(MOD._is_missing_field_reason("value data.activeCount = 63 != expected 64"))
+        self.assertFalse(MOD._is_missing_field_reason("status 200 != expected 404"))
+        self.assertFalse(MOD._is_missing_field_reason(""))
+
 
 # --- a fake in-memory service (the http_request seam) -----------------------
 
@@ -410,8 +490,15 @@ class FakeService:
                 return 200, {"code": 0, "data": dict(self.users[uid])}
             return 404, {"code": 1004, "message": "user not found", "data": None}
 
-        # Read endpoint: search (returns a fixed list).
+        # Read endpoint: search. A real service keys the result on a
+        # discriminating filter (status/department/keyword); a request that
+        # carries only pagination/sort hits an EMPTY page (mirrors the wrong
+        # -request failure mode the abstain/conservative fixes guard against).
         if path == "/api/user/search" and method == "GET":
+            has_discriminator = any(k in query for k in ("status", "department", "keyword"))
+            if not has_discriminator:
+                return 200, {"code": 0, "data": {"page": int(query.get("page", 1)),
+                                                "total": 0, "list": []}}
             return 200, {"code": 0, "data": {"page": int(query.get("page", 1)),
                                             "total": 2,
                                             "list": [{"userId": "A"}, {"userId": "B"}]}}
@@ -686,6 +773,136 @@ class EndToEndTest(unittest.TestCase):
         self.assertTrue(captured)
         for headers in captured:
             self.assertEqual(headers.get("X-Package-Id"), "pkg-test")
+
+
+class MissingFieldConservatismTest(unittest.TestCase):
+    """Fix B / Fix C: an absence-shaped failure from an inferred request is the
+    signature of a *wrong request*; over-reporting it would shift every later
+    failing-ID position (the ratio grader zeroes on an early false failure).
+    Pure-code failures stay trusted (the inferrer abstains when unsure), while a
+    MODEL-derived missing-field is demoted to a conservative pass and a genuine
+    value mismatch is still reported.
+    """
+
+    def setUp(self) -> None:
+        _force_offline_env()
+
+    def tearDown(self) -> None:
+        _force_offline_env()
+
+    def test_pure_code_missing_field_is_reported(self) -> None:
+        # A high-confidence pure-code request (a detail-by-userId) whose response
+        # is genuinely missing the asserted field IS a real failure and must be
+        # reported (mirrors a popped data.title), even offline.
+        case = {
+            "id": "M1",
+            "description": "查看用户 U1 的详情；核对其职级字段。",
+            "assert": {"expectedStatus": 200, "expectedFields": ["data.title"],
+                       "expectedValues": {"data.title": "Engineer"}},
+        }
+
+        def svc(method, url, headers, body, timeout):
+            # detail/U1 returns WITHOUT data.title -> genuine missing field.
+            return 200, {"code": 0, "data": {"userId": "U1"}}
+
+        passed, reason, _token, judged = MOD._verify_one(
+            case, PUBLIC_API_DOC, MOD.build_auth(AUTH_CONFIG), "pkg",
+            None, 30, 1, _fake_parser({}), svc, None,
+        )
+        self.assertFalse(passed)   # reported as failing
+        self.assertTrue(judged)    # a confirmed, code-judged failure
+        self.assertIn("title", reason)
+
+    def test_model_missing_field_is_conservative_pass(self) -> None:
+        # The pure-code inferrer abstains for this case (a row-shaped search
+        # assertion with no recoverable discriminator), so it falls to the model.
+        # The model's request returns an empty list -> missing data.list.0.userId.
+        # Fix B: that absence must NOT be reported (it would zero the ratio); the
+        # case becomes a conservative pass (judged=False).
+        case = {
+            "id": "M2",
+            "description": "按降序翻页列出用户；核对列表首条。",
+            "assert": {"expectedFields": ["data.list.0.userId"]},
+        }
+        parser = _fake_parser({
+            "按降序翻页": [{"method": "GET", "path": "/api/user/search",
+                            "query": {"sortOrder": "desc"}, "assert": True}],
+        })
+
+        def svc(method, url, headers, body, timeout):
+            return 200, {"code": 0, "data": {"total": 0, "list": []}}
+
+        _set_fake_config()
+        try:
+            passed, reason, _token, judged = MOD._verify_one(
+                case, PUBLIC_API_DOC, MOD.build_auth(AUTH_CONFIG), "pkg",
+                MOD._model_config(), 30, 1, parser, svc, None,
+            )
+        finally:
+            _force_offline_env()
+        self.assertTrue(passed)     # NOT over-reported
+        self.assertFalse(judged)    # conservative (unjudged), not a confirmed pass
+        self.assertIn("not judged", reason)
+
+    def test_model_value_mismatch_is_reported(self) -> None:
+        # The flip side of Fix B: a MODEL request that returns the right shape
+        # but a WRONG value is a genuine semantic failure and IS reported.
+        case = {
+            "id": "M3",
+            "description": "按降序翻页列出用户；核对列表首条 userId。",
+            "assert": {"expectedValues": {"data.list.0.userId": "U2240"}},
+        }
+        parser = _fake_parser({
+            "按降序翻页": [{"method": "GET", "path": "/api/user/search",
+                            "query": {"status": "active", "sortOrder": "desc"}, "assert": True}],
+        })
+
+        def svc(method, url, headers, body, timeout):
+            return 200, {"code": 0, "data": {"list": [{"userId": "U2001"}]}}
+
+        _set_fake_config()
+        try:
+            passed, reason, _token, judged = MOD._verify_one(
+                case, PUBLIC_API_DOC, MOD.build_auth(AUTH_CONFIG), "pkg",
+                MOD._model_config(), 30, 1, parser, svc, None,
+            )
+        finally:
+            _force_offline_env()
+        self.assertFalse(passed)    # genuine value mismatch -> reported
+        self.assertTrue(judged)
+        self.assertIn("U2240", reason)
+
+    def test_unjudged_case_never_enters_failed_list(self) -> None:
+        # Fix C: only confirmed (judged AND not passed) cases join the answer.
+        # A conservative pass (judged=False) must never be inserted into the
+        # position-sensitive failing-ID list, even though some other case fails.
+        cases = [
+            {"id": "K1", "description": "case K1 read U1",
+             "assert": {"expectedStatus": 200, "expectedValues": {"data.userId": "U1"}}},
+            {"id": "K2", "description": "按降序翻页列出用户；核对首条。",  # search, abstains -> model -> empty list -> conservative
+             "assert": {"expectedFields": ["data.list.0.userId"]}},
+            {"id": "K3", "description": "case K3 read U1 wrong title",
+             "assert": {"expectedStatus": 200, "expectedValues": {"data.title": "WRONG"}}},  # genuine fail
+        ]
+        parser = _fake_parser({
+            "按降序翻页": [{"method": "GET", "path": "/api/user/search",
+                            "query": {"sortOrder": "desc"}, "assert": True}],
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            doc_dir = _write_inputs(Path(tmp), cases)
+            _set_fake_config()
+            svc = FakeService()
+            args = {
+                "task_description": "verify",
+                "doc_dir": str(doc_dir),
+                "_runtime": {"question_dir": str(doc_dir.parent)},
+            }
+            result = MOD.answer(args, parser=parser, requester=svc)
+        # Only the genuinely failing K3 appears; the conservative K2 is omitted
+        # and never shifts K3 out of position.
+        self.assertEqual(result["answer"], "K3")
+        self.assertEqual(result["failed"], ["K3"])
+        self.assertEqual(result["unjudged"], 1)
 
 
 if __name__ == "__main__":

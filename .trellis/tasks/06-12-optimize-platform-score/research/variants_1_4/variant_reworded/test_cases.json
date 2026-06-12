@@ -1,0 +1,376 @@
+[
+  {
+    "id": "TC001",
+    "description": "先获取访问令牌，把用户 U1003 的邮箱改成 u1003.stable@example.com，职级调整为 Senior Engineer，随后拉取 U1003 的详情；以最后这次详情查询的返回为准。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.email",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1003",
+        "data.email": "u1003.stable@example.com",
+        "data.title": "Senior Engineer"
+      }
+    }
+  },
+  {
+    "id": "TC002",
+    "description": "拉取用户 U1003 的详情；核对上一步写入的邮箱与职级。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.email",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1003",
+        "data.email": "u1003.stable@example.com",
+        "data.title": "Senior Engineer"
+      }
+    }
+  },
+  {
+    "id": "TC003",
+    "description": "先获取访问令牌，把用户 U1008 的邮箱改成 u1008.stable@example.com，职级调整为 Auth First，随后拉取 U1008 的详情；以最后这次详情查询的返回为准。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.email",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1008",
+        "data.email": "u1008.stable@example.com",
+        "data.title": "Auth First"
+      }
+    }
+  },
+  {
+    "id": "TC004",
+    "description": "重新拉取用户 U1008 的详情；核对上一步写入的邮箱与职级。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.email",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1008",
+        "data.email": "u1008.stable@example.com",
+        "data.title": "Auth First"
+      }
+    }
+  },
+  {
+    "id": "TC005",
+    "description": "把 U3001 和 U3002 这两个人成批地标记为停用状态；核对批量更新接口的返回。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.updatedCount",
+        "data.failedCount"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.updatedCount": 2,
+        "data.failedCount": 0
+      }
+    }
+  },
+  {
+    "id": "TC006",
+    "description": "在平台部门里翻到第二页、每页两条、按升序排列地列出用户；核对分页信息以及列表里的第一条。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.page",
+        "data.pageSize",
+        "data.total",
+        "data.list.0.userId",
+        "data.list.0.name"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.page": 2,
+        "data.pageSize": 2,
+        "data.total": 3,
+        "data.list.0.userId": "U1003",
+        "data.list.0.name": "Carol"
+      }
+    }
+  },
+  {
+    "id": "TC007",
+    "description": "把处于活跃状态的用户列出来，停在第一页、每页一百条、升序；核对分页、总条数以及第 100 条记录。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.page",
+        "data.pageSize",
+        "data.total",
+        "data.list.0.userId",
+        "data.list.99.userId"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.page": 1,
+        "data.pageSize": 100,
+        "data.total": 240,
+        "data.list.0.userId": "U2001",
+        "data.list.99.userId": "U2100"
+      }
+    }
+  },
+  {
+    "id": "TC008",
+    "description": "用关键字 Alice 搜索用户，落在第一页、每页十条；核对命中数量与首条姓名。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.page",
+        "data.total",
+        "data.list.0.userId",
+        "data.list.0.name"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.page": 1,
+        "data.total": 1,
+        "data.list.0.userId": "U1001",
+        "data.list.0.name": "Alice"
+      }
+    }
+  },
+  {
+    "id": "TC009",
+    "description": "查看用户 U1010 的详尽资料（需要返回明细，verbose 打开）；核对其经理信息。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.manager.userId",
+        "data.manager.name"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1010",
+        "data.manager.userId": "M9001",
+        "data.manager.name": "ManagerA"
+      }
+    }
+  },
+  {
+    "id": "TC010",
+    "description": "去查一个并不存在的用户 U9999 的详情；核对异常返回。",
+    "assert": {
+      "expectedStatus": 404,
+      "expectedFields": [
+        "code",
+        "message",
+        "data"
+      ],
+      "expectedValues": {
+        "code": 1004,
+        "message": "user not found",
+        "data": null
+      }
+    }
+  },
+  {
+    "id": "TC011",
+    "description": "看一下 mobile 这个部门活跃用户的统计数字。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.department",
+        "data.activeCount"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.department": "mobile",
+        "data.activeCount": 64
+      }
+    }
+  },
+  {
+    "id": "TC012",
+    "description": "看一下 platform 这个部门活跃用户的统计数字。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.department",
+        "data.activeCount"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.department": "platform",
+        "data.activeCount": 128
+      }
+    }
+  },
+  {
+    "id": "TC013",
+    "description": "查看用户 U1004 的详情；核对基础字段。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.email"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1004",
+        "data.email": "user1004@example.com"
+      }
+    }
+  },
+  {
+    "id": "TC014",
+    "description": "查看用户 U1004 的详情；核对其职级字段。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1004",
+        "data.title": "Engineer"
+      }
+    }
+  },
+  {
+    "id": "TC015",
+    "description": "把活跃用户停在第一页、每页五条、按降序列出；核对打头的那一条。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.page",
+        "data.total",
+        "data.list.0.userId"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.page": 1,
+        "data.total": 240,
+        "data.list.0.userId": "U2240"
+      }
+    }
+  },
+  {
+    "id": "TC016",
+    "description": "把停用用户停在第一页、每页五条、按降序列出；核对打头的那一条。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.page",
+        "data.total",
+        "data.list.0.userId"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.page": 1,
+        "data.total": 9,
+        "data.list.0.userId": "U9009"
+      }
+    }
+  },
+  {
+    "id": "TC017",
+    "description": "拉取用户 U1003 的详情；核对前序写入后的邮箱与职级。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.email",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1003",
+        "data.email": "u1003.stable@example.com",
+        "data.title": "Senior Engineer"
+      }
+    }
+  },
+  {
+    "id": "TC018",
+    "description": "拉取用户 U1008 的详情；核对前序同令牌复用流程里第一次写入是否生效。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.email",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1008",
+        "data.email": "u1008.stable@example.com",
+        "data.title": "Auth First"
+      }
+    }
+  },
+  {
+    "id": "TC019",
+    "description": "查看用户 U1005 的详情；核对基础职级字段。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1005",
+        "data.title": "Engineer"
+      }
+    }
+  },
+  {
+    "id": "TC020",
+    "description": "查看用户 U1005 的详情；核对其职级字段应为 Quality Owner。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1005",
+        "data.title": "Quality Owner"
+      }
+    }
+  }
+]

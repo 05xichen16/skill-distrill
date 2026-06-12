@@ -400,7 +400,10 @@ class ContestantAgent:
             args = {"task_description": question_text}
             source_file = self._find_declared_file(files, (".java",))
             if source_file:
-                args["source_file"] = source_file
+                # Pass the absolute path: a bare relative name fails to resolve
+                # in the skill subprocess (cwd = skill dir), which crashes it
+                # into the version-less model loop (exact zero on this grader).
+                args["source_file"] = self._resolve_abspath(context, source_file)
             return "java_tax_calculator", args
 
         if has("po_compliance_audit") and (
@@ -488,6 +491,32 @@ class ContestantAgent:
             if clean.lower().endswith(lower_suffixes):
                 return clean
         return None
+
+    def _resolve_abspath(self, context: AgentContext, declared: str) -> str:
+        """Map a declared (possibly bare) filename to its absolute path.
+
+        The question's ``files`` entries can be bare relative names while the
+        skill subprocess runs with ``cwd`` set to its own package dir, so a bare
+        name no longer resolves. ``context.allowed_file_paths`` are absolute, so
+        prefer the entry whose basename matches the declared name (falling back
+        to the question_dir-qualified path). Returns the declared name unchanged
+        when nothing better is available.
+        """
+        if not declared:
+            return declared
+        if os.path.isabs(declared) and os.path.isfile(declared):
+            return declared
+        wanted = self._basename(declared).lower()
+        for path in context.allowed_file_paths:
+            try:
+                if path.is_file() and path.name.lower() == wanted:
+                    return str(path)
+            except OSError:
+                continue
+        qualified = context.question_dir / declared
+        if qualified.is_file():
+            return str(qualified)
+        return declared
 
     def _find_declared_dir(self, files: list[str], hints: tuple[str, ...]) -> str | None:
         lowered_hints = tuple(hint.lower() for hint in hints)

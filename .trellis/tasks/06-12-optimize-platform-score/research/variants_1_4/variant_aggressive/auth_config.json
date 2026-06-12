@@ -1,0 +1,22 @@
+{
+  "baseUrl": "http://127.0.0.1:18081",
+  "packageIdHeader": "X-Package-Id",
+  "token": {
+    "endpoint": "/api/auth/token",
+    "method": "POST",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "clientId": "agent_demo_client",
+      "clientSecret": "agent_demo_secret"
+    },
+    "responseTokenPath": "data.accessToken",
+    "authorizationHeaderFormat": "Bearer ${accessToken}"
+  },
+  "usage": {
+    "readApis": "读接口不需要 Authorization，但仍需要携带 X-Package-Id。",
+    "writeApis": "写接口需要同时携带 X-Package-Id 和 Authorization。",
+    "tokenReuseRule": "同一个 token 仅允许成功调用 1 次写接口；再次调用写接口需要重新获取 token，除非用例明确要求复用旧 token 并校验 401 响应。"
+  }
+}

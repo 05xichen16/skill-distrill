@@ -14,6 +14,9 @@ import base64
 import importlib.util
 import json
 import os
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -283,8 +286,6 @@ class JavaPathTest(unittest.TestCase):
         self.module._call_model = fake_model
         self.module.compile_java = lambda source, work_dir: ("TaxCalc", "")
 
-        wrong_then_right = {"round": 0}
-
         def fake_run(class_name, work_dir, salary):
             if len(repair_calls) == 1:
                 return "1.00"  # wrong on every example in round 1
@@ -377,7 +378,7 @@ class DeadlineSelfProtectionTest(unittest.TestCase):
         os.environ.pop("SKILL_BUDGET_SECONDS", None)
 
     def test_tiny_budget_skips_model_and_still_emits(self) -> None:
-        os.environ["SKILL_BUDGET_SECONDS"] = "25"  # deadline = now + 5s after the 20s margin
+        os.environ["SKILL_BUDGET_SECONDS"] = "25"  # < the emit margin: deadline already passed
         self.module.java_toolchain_available = lambda: True
         self.module._model_config = lambda: {"url": "u", "api_key": "k", "model": "m", "package_id": ""}
 
@@ -449,6 +450,128 @@ class TransientRetryTest(unittest.TestCase):
         self.assertTrue(is_transient(RuntimeError("gateway HTTP 503: x")))
         self.assertFalse(is_transient(RuntimeError("gateway HTTP 400: x")))
         self.assertFalse(is_transient(ValueError("nope")))
+
+
+class ResolveSourceFileTest(unittest.TestCase):
+    """The head-of-class platform failure is an unresolvable bare source name;
+    resolution must fall back to allowed_file_paths before the cwd guess."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    def test_allowed_paths_scanned_before_bare_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            java_path = os.path.join(tmp, "JavaSource_7_1.java")
+            with open(java_path, "w", encoding="utf-8") as handle:
+                handle.write("public class JavaSource_7_1 {}")
+            # No question_dir, bare name un-findable from cwd; only the declared
+            # allowed_file_paths entry locates the source.
+            runtime = {"allowed_file_paths": [java_path]}
+            resolved = self.module.resolve_source_file("JavaSource_7_1.java", runtime)
+            self.assertEqual(os.path.abspath(resolved), os.path.abspath(java_path))
+
+    def test_allowed_paths_basename_match_preferred(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wanted = os.path.join(tmp, "Wanted.java")
+            other = os.path.join(tmp, "Other.java")
+            for path in (wanted, other):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("public class C {}")
+            runtime = {"allowed_file_paths": [other, wanted]}
+            resolved = self.module.resolve_source_file("Wanted.java", runtime)
+            self.assertEqual(os.path.basename(resolved), "Wanted.java")
+
+    def test_absolute_name_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            java_path = os.path.join(tmp, "Abs.java")
+            with open(java_path, "w", encoding="utf-8") as handle:
+                handle.write("public class Abs {}")
+            resolved = self.module.resolve_source_file(java_path, {})
+            self.assertEqual(resolved, java_path)
+
+    def test_unresolvable_raises(self) -> None:
+        with self.assertRaises(FileNotFoundError):
+            self.module.resolve_source_file("Nope.java", {"allowed_file_paths": []})
+
+
+class EmergencyExitPathTest(unittest.TestCase):
+    """A forced exception must still emit a shaped 11-segment answer and exit 0,
+    never a bare {"error": ...} with a non-zero code (which drops stdout and
+    crashes the router into the version-less model loop = exact zero)."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    def _run_subprocess(self, payload: dict) -> subprocess.CompletedProcess:
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        # No model gateway: force the offline path.
+        for key in ("MODEL_CHAT_COMPLETIONS_URL", "MODEL_BASE_URL", "MODEL_API_KEY", "MODEL_NAME"):
+            env.pop(key, None)
+        return subprocess.run(
+            [sys.executable, str(SKILL_RUN)],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            timeout=60,
+            env=env,
+        )
+
+    def test_missing_source_emits_shape_and_exits_zero(self) -> None:
+        # source_file points nowhere and allowed_file_paths is empty: the normal
+        # answer() path raises FileNotFoundError inside resolve_source_file.
+        completed = self._run_subprocess(
+            {
+                "task_description": TASK_TEXT,
+                "source_file": "does_not_exist_anywhere.java",
+                "_runtime": {"allowed_file_paths": []},
+            }
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout.strip())
+        self.assertIn("answer", payload)
+        self.assertNotIn("error", {})  # sanity
+        segments = payload["answer"].split(",")
+        self.assertEqual(len(segments), 11)
+        self.assertIn("21.0.11", segments[0])
+        # 10 numeric tax segments (0.00 fallback is acceptable).
+        for segment in segments[1:]:
+            float(segment)
+
+    def test_emergency_answer_recovers_taxes_when_source_readable(self) -> None:
+        # answer() is monkeypatched to raise *after* the source is resolvable,
+        # so emergency_answer can still recover the real taxes offline.
+        original_answer = self.module.answer
+
+        def boom(args):
+            raise RuntimeError("forced failure after a readable source")
+
+        self.module.answer = boom
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                java_path = os.path.join(tmp, "JavaSource_7_1.java")
+                with open(java_path, "w", encoding="utf-8") as handle:
+                    handle.write(PUBLIC_SOURCE.read_text(encoding="utf-8"))
+                result = self.module.emergency_answer(
+                    {
+                        "task_description": TASK_TEXT,
+                        "source_file": java_path,
+                        "_runtime": {},
+                    },
+                    "forced",
+                )
+        finally:
+            self.module.answer = original_answer
+
+        segments = result["answer"].split(",")
+        self.assertEqual(len(segments), 11)
+        self.assertIn("21.0.11", segments[0])
+        # The public source decodes cleanly, so the emergency path reproduces
+        # the real hidden-case taxes rather than 0.00 placeholders.
+        self.assertEqual(
+            segments[1:], [_expected_tax(s) for s in self.module.hidden_salaries(TASK_TEXT)]
+        )
+        self.assertEqual(result["path"], "emergency")
 
 
 if __name__ == "__main__":

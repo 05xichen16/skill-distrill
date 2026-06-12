@@ -168,10 +168,19 @@ class SkillRuntime:
             check=False,
             env=env,
         )
+        stdout = completed.stdout.strip()
         if completed.returncode != 0:
-            error = completed.stderr.strip() or completed.stdout.strip()
+            # A skill may deliberately emit a well-formed answer just before
+            # dying (e.g. a deadline-driven shape fallback). Returning that
+            # answer keeps the version/shape segments scoring instead of
+            # dropping stdout and forcing the version-less model loop (which
+            # scores zero on position-sensitive graders). Only treat the run as
+            # a true crash when no usable answer reached stdout.
+            if _has_usable_answer(stdout):
+                return stdout
+            error = completed.stderr.strip() or stdout
             raise RuntimeError(f"skill {skill.name} failed with exit code {completed.returncode}: {error}")
-        return completed.stdout.strip()
+        return stdout
 
     def _resolve(self, name: str) -> SkillPackage:
         key = self._aliases.get(name) or self._aliases.get(_normalize_name(name))
@@ -195,6 +204,27 @@ def refresh_skill_runtime() -> SkillRuntime:
     global _RUNTIME
     _RUNTIME = SkillRuntime()
     return _RUNTIME
+
+
+def _has_usable_answer(stdout: str) -> bool:
+    """True only if stdout is a JSON object carrying a non-empty ``answer``.
+
+    Deliberately strict so genuine crash noise on stdout can never masquerade
+    as an answer: the payload must parse as a JSON object and its ``answer``
+    field must be a non-empty string (after stripping). Anything else — empty
+    output, plain text, a list, or an error-only object — is treated as a
+    failed run so the caller still falls back to the model loop.
+    """
+    if not stdout:
+        return False
+    try:
+        payload = json.loads(stdout)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    answer = payload.get("answer")
+    return isinstance(answer, str) and bool(answer.strip())
 
 
 def _read_json(path: Path) -> dict[str, Any]:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from pathlib import Path
 
 from source.solution.contestant_agent import ContestantAgent
 
@@ -28,10 +29,12 @@ ALL_ROUTED_SKILLS = [
 
 
 class _StubContext:
-    def __init__(self, skills=None, answer="ROUTED") -> None:
+    def __init__(self, skills=None, answer="ROUTED", allowed_file_paths=None, question_dir=".") -> None:
         self.available_skills = [{"name": name} for name in (skills or ALL_ROUTED_SKILLS)]
         self.calls = []
         self.answer = answer
+        self.allowed_file_paths = [Path(p) for p in (allowed_file_paths or [])]
+        self.question_dir = Path(question_dir)
 
     async def call_tool(self, name, args):
         self.calls.append((name, args))
@@ -154,6 +157,8 @@ class ContestantAgentRouterTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(route[1]["source_dir"], "./系统问题定位")
 
     def test_java_tax_route_uses_source_file(self) -> None:
+        # No allowed_file_paths to resolve against: the bare declared name is
+        # passed through unchanged (the skill still has its own fallbacks).
         route = self.agent._explicit_skill_route(
             question={
                 "title": "Java个人所得税计算器",
@@ -169,6 +174,27 @@ class ContestantAgentRouterTest(unittest.IsolatedAsyncioTestCase):
                 {"task_description": "hidden cases", "source_file": "JavaSource_7_1.java"},
             ),
         )
+
+    def test_java_tax_route_resolves_absolute_source_file(self) -> None:
+        # When the bare declared name maps to an absolute allowed_file_paths
+        # entry, the route passes the absolute path so the skill subprocess
+        # (cwd = skill dir) can find it instead of crashing into the model loop.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            abs_java = os.path.join(tmp, "JavaSource_7_1.java")
+            with open(abs_java, "w", encoding="utf-8") as handle:
+                handle.write("public class JavaSource_7_1 {}")
+            route = self.agent._explicit_skill_route(
+                question={
+                    "title": "Java个人所得税计算器",
+                    "question": "hidden cases",
+                    "files": ["JavaSource_7_1.java"],
+                },
+                context=_StubContext(allowed_file_paths=[abs_java]),
+            )
+            self.assertEqual(route[0], "java_tax_calculator")
+            self.assertEqual(os.path.abspath(route[1]["source_file"]), os.path.abspath(abs_java))
 
     def test_purchase_clean_route_uses_source_dir(self) -> None:
         route = self.agent._explicit_skill_route(

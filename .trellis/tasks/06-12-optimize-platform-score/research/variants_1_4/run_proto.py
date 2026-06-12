@@ -342,18 +342,6 @@ def assert_response(
     return True, ""
 
 
-def _is_missing_field_reason(reason: str) -> bool:
-    """True when an ``assert_response`` failure is an absence (missing field /
-    missing value field), as opposed to a present-but-wrong value or status.
-
-    A missing field/row is the signature of a *wrong request* (e.g. a search
-    that hit an empty page because the discriminating filter was lost), which a
-    code inference should not over-report; a wrong value/status means the right
-    request returned mismatching data, which is a genuine semantic failure.
-    """
-    return reason.startswith("missing field ") or reason.startswith("missing value field ")
-
-
 # --- model config + the model seam (parse_steps) ---------------------------
 
 def _model_config() -> Optional[Dict[str, str]]:
@@ -733,25 +721,10 @@ def _query_from_description(description: str) -> Dict[str, Any]:
         if match:
             query[key] = _coerce_query_value(match.group(1))
     if "sortOrder" not in query:
-        if any(word in text for word in ("降序", "倒序", "从大到小")):
+        if any(word in text for word in ("降序", "倒序")):
             query["sortOrder"] = "desc"
-        elif any(word in text for word in ("升序", "正序", "从小到大")):
+        elif any(word in text for word in ("升序", "正序")):
             query["sortOrder"] = "asc"
-    # Fix D: enum-aware status recovery. The status param is an enum
-    # ({active, inactive}); a reworded case may name it with a synonym
-    # ("活跃"/"在岗"=active, "停用"/"不活跃"=inactive) rather than
-    # ``status=active``. Recovering the discriminator here lets the search
-    # branch judge the case in code instead of abstaining to the model. This
-    # is paired with Fix A: if no discriminator is recovered, the search
-    # branch still abstains rather than emitting a confident-but-wrong request.
-    if "status" not in query:
-        active_words = ("active", "活跃", "在岗", "在职", "启用", "已激活")
-        inactive_words = ("inactive", "停用", "不活跃", "未激活", "禁用", "已停用")
-        lowered = text.lower()
-        if any(word in lowered if word.isascii() else word in text for word in inactive_words):
-            query["status"] = "inactive"
-        elif any(word in lowered if word.isascii() else word in text for word in active_words):
-            query["status"] = "active"
     for key, patterns in {
         "page": (r"第\s*(\d+)\s*页", r"page\s*(?:=|为|:)?\s*(\d+)"),
         "pageSize": (r"每页\s*(\d+)", r"pageSize\s*(?:=|为|:)?\s*(\d+)"),
@@ -962,14 +935,11 @@ def infer_steps_from_case(case: Dict[str, Any], api_doc: str, auth: Dict[str, An
         query = _merge_asserted_query_values(query, values)
         if not query:
             return []
-        # Fix A: a row-shaped assertion (``data.list.*`` or ``data.total``) is
-        # only answerable in code if we recovered the DISCRIMINATING filter
+        # PROTO FIX: a row-shaped assertion (data.list.* or data.total) is only
+        # answerable if we recovered the DISCRIMINATING filter
         # (status / department / keyword). With only pagination/sort keys the
-        # request hits the wrong result set (an empty or unrelated page), which
-        # would mis-FAIL a passing case and, because that over-report lands
-        # early in file order, zero the position-sensitive ratio. So ABSTAIN
-        # ([]) here and let the model parse the reworded description instead;
-        # offline this degrades to a conservative pass (no false failure).
+        # request hits the wrong result set, so ABSTAIN ([]) and let the model
+        # parse the reworded description instead of mis-failing a passing case.
         needs_rows = _has_any_path(paths, "data.list.", "data.total")
         has_discriminator = any(k in query for k in ("status", "department", "keyword"))
         if needs_rows and not has_discriminator:
@@ -1234,11 +1204,6 @@ def _verify_one(
         if error:
             status, body, error, token = run_case(steps, auth, package_id, timeout, requester, token)
         if not error:
-            # The pure-code inferrer is high-confidence: it only emits a request
-            # when it could pin the discriminating parameters from the case text
-            # (otherwise it abstains, see infer_steps_from_case). So a code
-            # judgment is trusted as-is here, including a genuine missing-field
-            # failure (e.g. a popped ``data.title``).
             passed, reason = assert_response(status if status is not None else -1, body, assertion)
             return passed, reason, token, True
         # Fall through to the model parser when a high-confidence inferred step
@@ -1280,19 +1245,6 @@ def _verify_one(
         return True, "%s; %s not judged (conservative pass)" % (error, case_id), token, False
 
     passed, reason = assert_response(status if status is not None else -1, body, assertion)
-    # Fix B: a model-derived request that yields a "field/row missing" failure
-    # is the tell-tale of the model having built the WRONG request (e.g. a
-    # search with the wrong filter that hit an empty page), not a genuine
-    # semantic failure. Over-reporting it is dangerous: an early false failure
-    # zeroes the position-sensitive ratio. A present-but-wrong value/status, by
-    # contrast, means the right request returned mismatching data and IS a real
-    # failure. So record a model FAIL only for value/status mismatches; treat a
-    # model "missing field" as unjudged (conservative pass) rather than a false
-    # positive that would shift every later failing-ID position.
-    if not passed and _is_missing_field_reason(reason):
-        return True, "%s (model request likely wrong; %s not judged, conservative pass)" % (
-            reason, case_id,
-        ), token, False
     return passed, reason, token, True
 
 
@@ -1370,14 +1322,7 @@ def answer(
         per_case.append({"id": case_id, "passed": passed, "judged": judged, "reason": reason})
         if not judged:
             unjudged += 1
-        # Fix C: only a CONFIRMED failure (judged AND not passed) joins the
-        # failing-ID answer. The grader is position-sensitive: an early false
-        # failure zeroes the ratio while a missing tail decays gently, and a
-        # low-confidence/conservative case always returns passed=True. Gating on
-        # ``judged`` makes that invariant explicit and future-proof, so a
-        # suspected-but-unconfirmed failure can never be inserted ahead of a
-        # confirmed one and shift the confirmed prefix out of position.
-        if judged and not passed and case_id:
+        if not passed and case_id:
             failed.append(case_id)
         if reason and not passed:
             warnings.append("%s FAILED: %s" % (case_id, reason))

@@ -1,0 +1,376 @@
+[
+  {
+    "id": "TC001",
+    "description": "请先拿到 token。接着对编号 U1003 的同事做资料维护：联系邮箱写成 u1003.stable@example.com，岗位级别填 Senior Engineer。完成后再去看一眼 U1003 的资料卡，核对这张资料卡。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.email",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1003",
+        "data.email": "u1003.stable@example.com",
+        "data.title": "Senior Engineer"
+      }
+    }
+  },
+  {
+    "id": "TC002",
+    "description": "再看一次 U1003 的资料卡，确认刚才维护的联系邮箱和岗位级别都已生效。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.email",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1003",
+        "data.email": "u1003.stable@example.com",
+        "data.title": "Senior Engineer"
+      }
+    }
+  },
+  {
+    "id": "TC003",
+    "description": "先取令牌。给编号 U1008 的人更新资料：邮箱改 u1008.stable@example.com，级别改 Auth First。然后翻看 U1008 的资料卡并核对它。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.email",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1008",
+        "data.email": "u1008.stable@example.com",
+        "data.title": "Auth First"
+      }
+    }
+  },
+  {
+    "id": "TC004",
+    "description": "回头再确认 U1008 的资料卡，看邮箱和级别是否如前一步所写。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.email",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1008",
+        "data.email": "u1008.stable@example.com",
+        "data.title": "Auth First"
+      }
+    }
+  },
+  {
+    "id": "TC005",
+    "description": "请将编号 U3001 与 U3002 的人一起置为不活跃；看一下批量处理接口回了什么。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.updatedCount",
+        "data.failedCount"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.updatedCount": 2,
+        "data.failedCount": 0
+      }
+    }
+  },
+  {
+    "id": "TC006",
+    "description": "想看 platform 这个部门的人员名单，一页放两条，取第 2 页，从小到大排；核对翻页字段和打头那一条。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.page",
+        "data.pageSize",
+        "data.total",
+        "data.list.0.userId",
+        "data.list.0.name"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.page": 2,
+        "data.pageSize": 2,
+        "data.total": 3,
+        "data.list.0.userId": "U1003",
+        "data.list.0.name": "Carol"
+      }
+    }
+  },
+  {
+    "id": "TC007",
+    "description": "列出所有在岗（active）的人，第 1 页就好，一页一百条，正序；看分页、总数，以及第 100 行那条。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.page",
+        "data.pageSize",
+        "data.total",
+        "data.list.0.userId",
+        "data.list.99.userId"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.page": 1,
+        "data.pageSize": 100,
+        "data.total": 240,
+        "data.list.0.userId": "U2001",
+        "data.list.99.userId": "U2100"
+      }
+    }
+  },
+  {
+    "id": "TC008",
+    "description": "拿 Alice 当搜索词找用户，第 1 页每页十条；看命中几条以及第一条叫什么。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.page",
+        "data.total",
+        "data.list.0.userId",
+        "data.list.0.name"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.page": 1,
+        "data.total": 1,
+        "data.list.0.userId": "U1001",
+        "data.list.0.name": "Alice"
+      }
+    }
+  },
+  {
+    "id": "TC009",
+    "description": "把编号 U1010 的人看个仔细，要带上详细信息那一档；重点核对他的直属经理。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.manager.userId",
+        "data.manager.name"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1010",
+        "data.manager.userId": "M9001",
+        "data.manager.name": "ManagerA"
+      }
+    }
+  },
+  {
+    "id": "TC010",
+    "description": "故意查一个查不到的人 U9999；看接口怎么报错。",
+    "assert": {
+      "expectedStatus": 404,
+      "expectedFields": [
+        "code",
+        "message",
+        "data"
+      ],
+      "expectedValues": {
+        "code": 1004,
+        "message": "user not found",
+        "data": null
+      }
+    }
+  },
+  {
+    "id": "TC011",
+    "description": "mobile 团队现在有多少活跃的人，给个统计。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.department",
+        "data.activeCount"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.department": "mobile",
+        "data.activeCount": 64
+      }
+    }
+  },
+  {
+    "id": "TC012",
+    "description": "platform 团队现在有多少活跃的人，给个统计。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.department",
+        "data.activeCount"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.department": "platform",
+        "data.activeCount": 128
+      }
+    }
+  },
+  {
+    "id": "TC013",
+    "description": "翻一下编号 U1004 的资料卡，看基本信息对不对。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.email"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1004",
+        "data.email": "user1004@example.com"
+      }
+    }
+  },
+  {
+    "id": "TC014",
+    "description": "再看编号 U1004 的资料卡，这回盯着岗位级别那一栏。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1004",
+        "data.title": "Engineer"
+      }
+    }
+  },
+  {
+    "id": "TC015",
+    "description": "在岗的人按从大到小排，第 1 页每页五条；看排在最前的是谁。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.page",
+        "data.total",
+        "data.list.0.userId"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.page": 1,
+        "data.total": 240,
+        "data.list.0.userId": "U2240"
+      }
+    }
+  },
+  {
+    "id": "TC016",
+    "description": "不活跃的人按倒序排，第 1 页每页五条；看排在最前的是谁。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.page",
+        "data.total",
+        "data.list.0.userId"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.page": 1,
+        "data.total": 9,
+        "data.list.0.userId": "U9009"
+      }
+    }
+  },
+  {
+    "id": "TC017",
+    "description": "再看 U1003 的资料卡，核对之前维护过的邮箱与级别。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.email",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1003",
+        "data.email": "u1003.stable@example.com",
+        "data.title": "Senior Engineer"
+      }
+    }
+  },
+  {
+    "id": "TC018",
+    "description": "回看 U1008 的资料卡，确认那次复用令牌的流程里首笔写入是否落地。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.email",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1008",
+        "data.email": "u1008.stable@example.com",
+        "data.title": "Auth First"
+      }
+    }
+  },
+  {
+    "id": "TC019",
+    "description": "翻一下编号 U1005 的资料卡，看基础的岗位级别。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1005",
+        "data.title": "Engineer"
+      }
+    }
+  },
+  {
+    "id": "TC020",
+    "description": "再看编号 U1005 的资料卡，岗位级别这一栏应当是 Quality Owner。",
+    "assert": {
+      "expectedStatus": 200,
+      "expectedFields": [
+        "code",
+        "data.userId",
+        "data.title"
+      ],
+      "expectedValues": {
+        "code": 0,
+        "data.userId": "U1005",
+        "data.title": "Quality Owner"
+      }
+    }
+  }
+]
