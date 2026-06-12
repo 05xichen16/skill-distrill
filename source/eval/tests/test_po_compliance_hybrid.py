@@ -27,7 +27,13 @@ SKILL_RUN = (
     REPO_ROOT / "source" / "solution" / "skills" / "po_compliance_audit" / "scripts" / "run.py"
 )
 
-ENV_KEYS = ("MODEL_CHAT_COMPLETIONS_URL", "MODEL_BASE_URL", "MODEL_API_KEY", "MODEL_NAME")
+ENV_KEYS = (
+    "MODEL_CHAT_COMPLETIONS_URL",
+    "MODEL_BASE_URL",
+    "MODEL_API_KEY",
+    "MODEL_NAME",
+    "PO_AUDIT_USE_LLM",
+)
 
 
 def _load_module():
@@ -115,7 +121,7 @@ class ThresholdAndDatesTest(unittest.TestCase):
     def test_status_keyword_tristate(self) -> None:
         self.assertTrue(self.module.is_terminal_status("已付款"))
         self.assertFalse(self.module.is_terminal_status("审批中"))
-        self.assertIsNone(self.module.is_terminal_status("已终审归档"))
+        self.assertTrue(self.module.is_terminal_status("已终审归档"))
 
 
 class HybridAuditTest(unittest.TestCase):
@@ -349,6 +355,28 @@ class HybridAuditTest(unittest.TestCase):
         self.assertEqual(result["threshold"], 50000)
         self.assertIn("PO-4", result["answer"])
 
+    def test_llm_can_be_disabled_for_exact_grader(self) -> None:
+        os.environ["PO_AUDIT_USE_LLM"] = "0"
+        self.module._model_config = lambda: {
+            "url": "u", "api_key": "k", "model": "m", "package_id": "",
+        }
+
+        def must_not_call(config, prompt, timeout):
+            raise AssertionError("PO_AUDIT_USE_LLM=0 must skip model calls")
+
+        self.module._call_model = must_not_call
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                source = _write_fixture(Path(tmp))
+                result = self.module.answer(
+                    {"task_description": TASK_TEXT_60K, "source_dir": str(source), "_runtime": {}}
+                )
+        finally:
+            os.environ.pop("PO_AUDIT_USE_LLM", None)
+
+        self.assertIn("PO-4", result["answer"])
+        self.assertTrue(any("disabled" in w for w in result["warnings"]))
+
 
 class DeadlineSelfProtectionTest(unittest.TestCase):
     """A tiny SKILL_BUDGET_SECONDS must degrade deep audits to the code rules
@@ -387,9 +415,9 @@ class DeadlineSelfProtectionTest(unittest.TestCase):
             )
 
         # Both deep-audited POs (PO-1 via LLM status, PO-4) fell back to the
-        # code rules: PO-1's evidence wording is outside the keyword table and
-        # PO-4's scope fails -> both listed; the answer stays well-formed.
-        self.assertEqual(result["answer"], "PO-1,PO-4")
+        # code rules. PO-1's "准予执行" approval is now recognized by the
+        # deterministic path; PO-4's scope still fails.
+        self.assertEqual(result["answer"], "PO-4")
         self.assertTrue(any("deadline" in w for w in result["warnings"]))
         # the batched status call still ran, with its timeout clamped to the budget
         self.assertTrue(status_timeouts and status_timeouts[0] <= 10)

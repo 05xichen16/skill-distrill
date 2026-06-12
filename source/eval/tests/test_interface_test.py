@@ -225,6 +225,22 @@ class StepParsingHelpersTest(unittest.TestCase):
 
 
 class DeterministicInferenceTest(unittest.TestCase):
+    def test_english_one_line_endpoint_catalog(self) -> None:
+        api_doc = """
+### User detail
+GET /v2/users/{userId}
+
+### Search users
+GET /v2/users/search
+
+### Remove user
+DELETE /v2/users/{userId}
+"""
+        catalog = MOD.parse_endpoint_catalog(api_doc)
+        self.assertEqual(catalog["detail"]["path"], "/v2/users/{userId}")
+        self.assertEqual(catalog["search"]["path"], "/v2/users/search")
+        self.assertEqual(catalog["delete"]["path"], "/v2/users/{userId}")
+
     def test_update_then_detail_steps(self) -> None:
         case = {
             "id": "T1",
@@ -273,6 +289,48 @@ class DeterministicInferenceTest(unittest.TestCase):
         self.assertEqual(steps[0]["query"]["page"], 1)
         self.assertEqual(steps[0]["query"]["pageSize"], 5)
         self.assertEqual(steps[0]["query"]["sortOrder"], "desc")
+
+    def test_search_query_from_natural_language_and_assertions(self) -> None:
+        case = {
+            "id": "T4",
+            "description": "查询 platform 部门用户列表，第2页，每页2条，按升序排列。",
+            "assert": {
+                "expectedFields": ["data.page", "data.pageSize", "data.list.0.userId"],
+                "expectedValues": {"data.page": 2, "data.pageSize": 2},
+            },
+        }
+        steps = MOD.infer_steps_from_case(case, PUBLIC_API_DOC, MOD.build_auth(AUTH_CONFIG))
+        self.assertEqual(steps[0]["path"], "/api/user/search")
+        self.assertEqual(steps[0]["query"]["department"], "platform")
+        self.assertEqual(steps[0]["query"]["page"], 2)
+        self.assertEqual(steps[0]["query"]["pageSize"], 2)
+        self.assertEqual(steps[0]["query"]["sortOrder"], "asc")
+
+    def test_delete_then_detail_steps(self) -> None:
+        case = {
+            "id": "T5",
+            "description": "删除用户 U1004，然后查询 U1004 详情；校验异常响应。",
+            "assert": {"expectedStatus": 404, "expectedValues": {"code": 1004}},
+        }
+        steps = MOD.infer_steps_from_case(case, PUBLIC_API_DOC, MOD.build_auth(AUTH_CONFIG))
+        self.assertEqual(len(steps), 2)
+        self.assertEqual(steps[0]["method"], "DELETE")
+        self.assertTrue(steps[0]["write"])
+        self.assertFalse(steps[0]["assert"])
+        self.assertEqual(steps[1]["path"], "/api/user/detail/U1004")
+        self.assertTrue(steps[1]["assert"])
+
+    def test_note_create_steps(self) -> None:
+        case = {
+            "id": "T6",
+            "description": "为用户 U1007 创建备注，备注为需要二线跟进；校验创建响应。",
+            "assert": {"expectedValues": {"data.userId": "U1007", "data.content": "需要二线跟进"}},
+        }
+        steps = MOD.infer_steps_from_case(case, PUBLIC_API_DOC, MOD.build_auth(AUTH_CONFIG))
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["path"], "/api/user/note/create")
+        self.assertEqual(steps[0]["body"], {"userId": "U1007", "content": "需要二线跟进"})
+        self.assertTrue(steps[0]["write"])
 
 
 # --- a fake in-memory service (the http_request seam) -----------------------

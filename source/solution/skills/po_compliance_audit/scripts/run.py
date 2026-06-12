@@ -227,11 +227,15 @@ def parse_date_text(text: str) -> Optional[date]:
 
 _BAD_STATUS = [
     "draft", "under_review", "review", "pending", "cancel", "cancelled", "void",
+    "voided", "rejected", "withdrawn", "on_hold", "hold", "待复核", "待法务",
     "草稿", "评审中", "审批中", "待补件", "待审批", "取消", "作废", "已取消", "已作废",
+    "撤销", "驳回", "暂停", "暂缓",
 ]
 _GOOD_STATUS = [
     "completed", "closed", "accepted", "paid", "settled", "finished", "done",
+    "delivered", "archived", "invoiced",
     "已完成", "已支付", "已验收", "已关闭", "已结案", "已付款", "已结清", "已终验", "已交付",
+    "已归档", "已终审", "终审通过", "验收完成", "交付完成", "已入账", "已结算",
 ]
 
 
@@ -319,10 +323,10 @@ def parse_amount_threshold(task_description: str) -> Optional[int]:
 
 
 def split_items(text: str) -> List[str]:
-    raw = re.split(r"[、,，]|和", text)
+    raw = re.split(r"[、,，;；/&]|和|及|以及", text)
     result = []
     for item in raw:
-        cleaned = re.sub(r"\s*\d+\s*台", "", item).strip()
+        cleaned = re.sub(r"\s*\d+\s*(?:台|套|项|个|件|人天|天)", "", item).strip()
         cleaned = cleaned.replace("采购", "").strip()
         if cleaned:
             result.append(cleaned)
@@ -330,8 +334,8 @@ def split_items(text: str) -> List[str]:
 
 
 def item_in_scope(item: str, scope: str) -> bool:
-    normalized_item = item.replace(" ", "")
-    normalized_scope = scope.replace(" ", "")
+    normalized_item = re.sub(r"[\s（）()《》「」【】]", "", item)
+    normalized_scope = re.sub(r"[\s（）()《》「」【】]", "", scope)
     if normalized_item in normalized_scope:
         return True
     for token in ["服务器", "交换机", "员工笔记本", "测试手机", "边缘盒子", "联调样机", "培训"]:
@@ -351,8 +355,8 @@ def load_roles(rows: List[Dict[str, str]]) -> Dict[str, List[Dict[str, Any]]]:
         roles.setdefault(email, []).append(
             {
                 "role": row.get("role", "").strip(),
-                "valid_from": parse_iso(row.get("valid_from", "")),
-                "valid_to": parse_iso(row.get("valid_to", "")),
+                "valid_from": parse_date_text(row.get("valid_from", "")) or parse_iso(row.get("valid_from", "")),
+                "valid_to": parse_date_text(row.get("valid_to", "")) or parse_iso(row.get("valid_to", "")),
             }
         )
     return roles
@@ -360,7 +364,11 @@ def load_roles(rows: List[Dict[str, str]]) -> Dict[str, List[Dict[str, Any]]]:
 
 def is_valid_vp(email: str, sent_date: date, roles: Dict[str, List[Dict[str, Any]]]) -> bool:
     for role in roles.get(email.lower(), []):
-        if role["role"] == "VP" and role["valid_from"] <= sent_date <= role["valid_to"]:
+        role_text = str(role["role"]).strip().lower()
+        if "assistant" in role_text or "助理" in role_text:
+            continue
+        is_vp_role = role_text in {"vp", "vice president"} or role_text == "副总裁"
+        if is_vp_role and role["valid_from"] <= sent_date <= role["valid_to"]:
             return True
     return False
 
@@ -369,11 +377,11 @@ def message_blocks(text: str) -> List[Dict[str, str]]:
     blocks: List[Dict[str, str]] = []
     current: Dict[str, str] = {"from": "", "date": "", "body": ""}
     for line in text.splitlines():
-        if line.startswith("From: "):
+        if re.match(r"^\s*(?:From|发件人|发送人)\s*[:：]", line, re.IGNORECASE):
             if current.get("from") or current.get("body"):
                 blocks.append(current)
             current = {"from": line, "date": "", "body": ""}
-        elif line.startswith("Date: "):
+        elif re.match(r"^\s*(?:Date|发送时间|日期|时间)\s*[:：]", line, re.IGNORECASE):
             current["date"] = line
         else:
             current["body"] += line + "\n"
@@ -383,13 +391,24 @@ def message_blocks(text: str) -> List[Dict[str, str]]:
 
 
 def approval_positive(body: str) -> bool:
-    positives = ["批准", "同意", "确认", "通过", "可以采购", "可以按当前报价执行", "均已看过并批准"]
-    negatives = ["先不要", "待确认", "先评估", "补材料后再看", "另开评估", "不放进这封批准", "原单据编号归档"]
+    positives = [
+        "批准", "同意", "确认", "通过", "准予执行", "可以采购", "可以按当前报价执行",
+        "均已看过并批准", "继续推进", "按完整清单推进", "approved", "approve", "go ahead",
+    ]
+    negatives = [
+        "先不要", "待确认", "先评估", "待补材料", "补材料后再看", "另开评估",
+        "不放进这封批准", "原单据编号归档", "只批准其中", "剩余部分", "剩余项",
+        "另行确认", "not approved", "do not approve", "pending",
+    ]
     return any(word in body for word in positives) and not any(word in body for word in negatives)
 
 
 def approval_covers_all(po: Dict[str, str], body: str) -> bool:
-    broad = ["整张 PO", "完整清单", "都在本次批准范围内", "都在批准范围内", "三项一起批", "均已看过并批准", "清单按正文所列"]
+    broad = [
+        "整张 PO", "整单", "完整清单", "全部清单", "都在本次批准范围内", "都在批准范围内",
+        "均在批准范围内", "三项一起批", "两项都批", "均已看过并批准", "清单按正文所列",
+        "按完整清单推进", "all items", "full list",
+    ]
     if any(word in body for word in broad):
         return True
     return all(item in body for item in split_items(po.get("service_items", "")))
@@ -750,7 +769,8 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
     evidence_by_id = {row["evidence_id"]: row for row in evidence_rows}
 
     warnings: List[str] = []
-    config = _model_config()
+    use_llm = _env_bool("PO_AUDIT_USE_LLM", True)
+    config = _model_config() if use_llm else None
     gateway_timeout = _env_int("AGENT_DEMO_TIMEOUT_SECONDS", 60, minimum=5)
     timeout = _env_int("PO_AUDIT_MODEL_TIMEOUT_SECONDS", min(gateway_timeout, 8), minimum=3)
     batch_timeout = _env_int("PO_AUDIT_BATCH_TIMEOUT_SECONDS", min(gateway_timeout, max(timeout, 20)), minimum=5)
@@ -905,7 +925,10 @@ def answer(args: Dict[str, Any]) -> Dict[str, Any]:
             bad.append(po_id)
 
     if config is None:
-        warnings.append("model gateway not configured; deep audit ran on code keyword rules only")
+        if use_llm:
+            warnings.append("model gateway not configured; deep audit ran on code keyword rules only")
+        else:
+            warnings.append("PO_AUDIT_USE_LLM disabled; deep audit ran on code rules only")
     elif batch_skipped_deadline:
         warnings.append("batch deep audit skipped because deadline was near")
     elif judged_by_code:

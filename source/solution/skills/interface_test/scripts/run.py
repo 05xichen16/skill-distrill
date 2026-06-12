@@ -598,28 +598,46 @@ _KV_RE = re.compile(
 )
 _USER_ID_RE = re.compile(r"\bU\d+\b")
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+")
+_PATH_TOKEN_RE = re.compile(
+    r"`(/[^`\s]+)`|(?:路径|path|url|endpoint|接口)\s*[:：]\s*`?(/[^`\s]+)`?",
+    re.IGNORECASE,
+)
+_METHOD_TOKEN_RE = re.compile(r"\b(GET|POST|PUT|PATCH|DELETE)\b", re.IGNORECASE)
 
 
 def parse_endpoint_catalog(api_doc: str) -> Dict[str, Dict[str, str]]:
     """Extract endpoint paths/methods from the markdown API catalogue."""
     endpoints: List[Dict[str, str]] = []
     current: Dict[str, str] = {"title": "", "path": "", "method": ""}
+
+    def flush() -> None:
+        if current.get("path"):
+            endpoints.append(dict(current))
+
     for raw_line in (api_doc or "").splitlines():
         line = raw_line.strip()
         if line.startswith("###"):
-            if current.get("path"):
-                endpoints.append(current)
+            flush()
             current = {"title": line.lstrip("#").strip(), "path": "", "method": ""}
             continue
-        path_match = re.search(r"`([^`]+)`", line)
-        if _CN_PATH_LABEL in line and path_match:
-            current["path"] = path_match.group(1).strip()
-            continue
-        method_match = re.search(r"\b(GET|POST|PUT|PATCH|DELETE)\b", line, re.IGNORECASE)
-        if _CN_METHOD_LABEL in line and method_match:
+
+        path_match = _PATH_TOKEN_RE.search(line)
+        if not path_match:
+            # English docs often use one-line forms such as "GET /v1/users/{id}".
+            loose = re.search(r"\b(?:GET|POST|PUT|PATCH|DELETE)\s+(/[\w./{}:-]+)", line, re.IGNORECASE)
+            if loose:
+                current["path"] = loose.group(1).strip()
+        else:
+            current["path"] = (path_match.group(1) or path_match.group(2) or "").strip()
+
+        method_match = _METHOD_TOKEN_RE.search(line)
+        if method_match and (_CN_METHOD_LABEL in line or current.get("path") or "method" in line.lower()):
             current["method"] = method_match.group(1).upper()
-    if current.get("path"):
-        endpoints.append(current)
+
+        if current.get("path") and current.get("method") and _METHOD_TOKEN_RE.search(line) and "/" in line:
+            flush()
+            current = {"title": current.get("title", ""), "path": "", "method": ""}
+    flush()
 
     def pick(kind: str) -> Dict[str, str]:
         for endpoint in endpoints:
@@ -635,9 +653,11 @@ def parse_endpoint_catalog(api_doc: str) -> Dict[str, Dict[str, str]]:
                 "batch" in path or ("status" in path and "update" in path)
             ):
                 return endpoint
-            if kind == "delete" and (method == "DELETE" or "delete" in path):
+            if kind == "delete" and (method == "DELETE" or any(token in path for token in ("delete", "remove"))):
                 return endpoint
-            if kind == "note_create" and method in {"POST", "PUT", "PATCH"} and "note" in path:
+            if kind == "note_create" and method in {"POST", "PUT", "PATCH"} and any(
+                token in path for token in ("note", "comment", "remark")
+            ):
                 return endpoint
             if kind == "stat_active" and method == "GET" and (
                 "stat" in path or "active" in path
@@ -683,6 +703,39 @@ def _query_from_description(description: str) -> Dict[str, Any]:
     query: Dict[str, Any] = {}
     for key, value in _KV_RE.findall(description or ""):
         query[key] = _coerce_query_value(value)
+    text = description or ""
+    for key in ("department", "status", "keyword", "sortOrder"):
+        if key in query:
+            continue
+        if key == "department":
+            preposed = re.search(r"\b([A-Za-z0-9_\-]+)\s*部门", text, re.IGNORECASE)
+            if preposed:
+                query[key] = _coerce_query_value(preposed.group(1))
+                continue
+        match = re.search(
+            r"(?:%s|%s)\s*(?:=|:|为|是)\s*([A-Za-z0-9_\-\u4e00-\u9fff]+)"
+            % (key, {"department": "部门", "status": "状态", "keyword": "关键字", "sortOrder": "排序方向"}[key]),
+            text,
+            re.IGNORECASE,
+        )
+        if match:
+            query[key] = _coerce_query_value(match.group(1))
+    if "sortOrder" not in query:
+        if any(word in text for word in ("降序", "倒序")):
+            query["sortOrder"] = "desc"
+        elif any(word in text for word in ("升序", "正序")):
+            query["sortOrder"] = "asc"
+    for key, patterns in {
+        "page": (r"第\s*(\d+)\s*页", r"page\s*(?:=|为|:)?\s*(\d+)"),
+        "pageSize": (r"每页\s*(\d+)", r"pageSize\s*(?:=|为|:)?\s*(\d+)"),
+    }.items():
+        if key in query:
+            continue
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                query[key] = int(match.group(1))
+                break
     return query
 
 
@@ -717,6 +770,31 @@ def _email_from_description(description: str, fallback: Any = None) -> Optional[
     if match:
         return match.group(0)
     return str(fallback) if fallback is not None else None
+
+
+def _content_from_description(description: str, fallback: Any = None) -> Optional[str]:
+    for pattern in (
+        r"(?:content|备注内容|备注)\s*(?:=|为|设置为|:|：)\s*([^,;%s%s%s%s]+)"
+        % (_CN_COMMA, _CN_ENUM, _CN_SEMI, _CN_PERIOD),
+    ):
+        match = re.search(pattern, description or "", re.IGNORECASE)
+        if match:
+            return match.group(1).strip().strip('"')
+    return str(fallback) if fallback is not None else None
+
+
+def _merge_asserted_query_values(query: Dict[str, Any], values: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(query)
+    for target, source in (
+        ("page", "data.page"),
+        ("pageSize", "data.pageSize"),
+        ("department", "data.department"),
+        ("status", "data.status"),
+        ("keyword", "data.keyword"),
+    ):
+        if target not in merged and source in values:
+            merged[target] = values[source]
+    return merged
 
 
 def _status_from_description(description: str, query: Dict[str, Any]) -> Optional[str]:
@@ -772,7 +850,47 @@ def infer_steps_from_case(case: Dict[str, Any], api_doc: str, auth: Dict[str, An
         }))
         return steps
 
-    is_update = bool(re.search(r"(?:更新用户|修改用户|更新\s*user)", description, re.IGNORECASE))
+    is_delete = bool(re.search(r"(?:删除用户|移除用户|delete|remove)", description, re.IGNORECASE))
+    if is_delete:
+        endpoint = _endpoint(catalog, "delete", "/api/user/delete/{userId}", "DELETE")
+        user_id = _first_user_id(description, values)
+        if not user_id:
+            return []
+        steps.append(_normalise_step({
+            "method": endpoint["method"],
+            "path": _fill_path(endpoint["path"], user_id),
+            "write": True,
+            "assert": False,
+        }))
+        if re.search(r"(?:查询|detail|get)", description, re.IGNORECASE):
+            detail = _endpoint(catalog, "detail", "/api/user/detail/{userId}", "GET")
+            steps.append(_normalise_step({
+                "method": detail["method"],
+                "path": _fill_path(detail["path"], user_id),
+                "write": False,
+                "assert": True,
+            }))
+        else:
+            steps[-1]["assert"] = True
+        return steps
+
+    is_note = bool(re.search(r"(?:备注|note|comment|remark)", description, re.IGNORECASE))
+    if is_note:
+        endpoint = _endpoint(catalog, "note_create", "/api/user/note/create", "POST")
+        user_id = _first_user_id(description, values)
+        content = _content_from_description(description, values.get("data.content") or values.get("data.note.content"))
+        if not user_id or not content:
+            return []
+        steps.append(_normalise_step({
+            "method": endpoint["method"],
+            "path": endpoint["path"],
+            "body": {"userId": user_id, "content": content},
+            "write": True,
+            "assert": True,
+        }))
+        return steps
+
+    is_update = bool(re.search(r"(?:更新用户|修改用户|设置用户|更新\s*user|modify\s*user)", description, re.IGNORECASE))
     if is_update:
         endpoint = _endpoint(catalog, "update", "/api/user/update", "POST")
         user_id = _first_user_id(description, values)
@@ -814,6 +932,7 @@ def infer_steps_from_case(case: Dict[str, Any], api_doc: str, auth: Dict[str, An
 
     if _has_any_path(paths, "data.page", "data.pageSize", "data.total", "data.list."):
         endpoint = _endpoint(catalog, "search", "/api/user/search", "GET")
+        query = _merge_asserted_query_values(query, values)
         if not query:
             return []
         steps.append(_normalise_step({

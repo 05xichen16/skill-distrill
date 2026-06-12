@@ -485,6 +485,13 @@ _STRING_LITERAL_RE = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
 _ROW_RE = re.compile(
     r"[\[{]\s*(-?\d+(?:\.\d+)?(?:\s*,\s*-?\d+(?:\.\d+)?){2,3})\s*[\]}]"
 )
+_ARRAY_ASSIGN_RE = re.compile(
+    r"(?:static\s+|final\s+|private\s+|public\s+|protected\s+)*"
+    r"(?:double|float|int|long|BigDecimal)\s*\[\]\s*([A-Za-z_]\w*)\s*=\s*"
+    r"(?:new\s+(?:double|float|int|long|BigDecimal)\s*\[\]\s*)?"
+    r"\{([^{};]+)\}",
+    re.DOTALL,
+)
 
 
 def _decode_string_literal(value: str) -> str:
@@ -533,6 +540,127 @@ def _numeric_rows(text: str) -> List[List[float]]:
         if 3 <= len(values) <= 4:
             rows.append(values)
     return rows
+
+
+def _tax_rows_from_lines(text: str) -> List[List[float]]:
+    """Parse common prose/markdown tax-table lines into numeric rows.
+
+    Hidden variants often move the real table into comments instead of array
+    literals, e.g. "不超过3000元: 3%, 0" or markdown rows. These rows are still
+    validated against the worked examples before use.
+    """
+    rows: List[List[float]] = []
+    table_context = False
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            table_context = False
+            continue
+        lowered = line.lower()
+        if any(token in lowered for token in ("税率", "速算", "tax rate", "quick", "deduct")):
+            table_context = True
+
+        numbers = [float(item) for item in _NUMBER_RE.findall(line)]
+        if len(numbers) < 3:
+            continue
+
+        has_tax_signal = table_context or "%" in line or any(
+            token in lowered for token in ("税率", "速算", "bracket", "tax", "deduct")
+        )
+        if not has_tax_signal:
+            continue
+
+        compact = re.sub(r"\s+", "", line)
+        if re.search(r"(?:不超过|<=|≤|以下|以内|up\s*to)", lowered, re.IGNORECASE):
+            upper, rate, quick = numbers[0], numbers[1], numbers[2]
+            rows.append([0.0, upper, rate, quick])
+            continue
+        if re.search(r"(?:以上|及以上|over|above|超过)", lowered, re.IGNORECASE) and len(numbers) == 3:
+            lower, rate, quick = numbers
+            rows.append([lower + 1.0, 999999999.0, rate, quick])
+            continue
+        if re.search(r"(?:超过|大于)?\d+(?:\.\d+)?(?:元)?(?:至|到|-|~|～)\d+", compact):
+            lower, upper, rate, quick = numbers[0], numbers[1], numbers[2], numbers[3] if len(numbers) >= 4 else 0.0
+            rows.append([lower + 1.0, upper, rate, quick])
+            continue
+        if "|" in line and 3 <= len(numbers) <= 4:
+            rows.append(numbers)
+            continue
+    return rows
+
+
+def _array_literals(text: str) -> List[Tuple[str, List[float]]]:
+    arrays: List[Tuple[str, List[float]]] = []
+    for match in _ARRAY_ASSIGN_RE.finditer(text or ""):
+        values = [float(item) for item in _NUMBER_RE.findall(match.group(2))]
+        if len(values) >= 2:
+            arrays.append((match.group(1).lower(), values))
+    return arrays
+
+
+def _parallel_array_tables(text: str) -> List[List[List[float]]]:
+    """Build bracket tables from upper/rate/quick arrays in Java source."""
+    arrays = _array_literals(text)
+    variants: List[List[List[float]]] = []
+    if len(arrays) < 3:
+        return variants
+
+    def by_name(*tokens: str) -> List[List[float]]:
+        return [values for name, values in arrays if any(token in name for token in tokens)]
+
+    uppers = by_name("upper", "limit", "threshold", "bracket", "level", "ceil", "range")
+    lowers = by_name("lower", "floor", "start", "min")
+    rates = by_name("rate", "rates")
+    quicks = by_name("quick", "deduct", "deduction", "subtract")
+
+    # Structural fallback for tersely named arrays: one increasing large array
+    # for bounds, one small positive array for rates, and one increasing array
+    # for quick deductions.
+    if not uppers:
+        uppers = [
+            values for _name, values in arrays
+            if len(values) >= 3 and values == sorted(values) and max(values) > 1000
+        ]
+    if not rates:
+        rates = [
+            values for _name, values in arrays
+            if len(values) >= 3 and all(0 < value <= 100 for value in values) and max(values) <= 60
+        ]
+    if not quicks:
+        quicks = [
+            values for _name, values in arrays
+            if len(values) >= 3 and values == sorted(values) and values[0] == 0 and max(values) < 1000000
+        ]
+
+    for upper_values in uppers:
+        for rate_values in rates:
+            for quick_values in quicks:
+                if upper_values is rate_values or upper_values is quick_values or rate_values is quick_values:
+                    continue
+                n = min(len(upper_values), len(rate_values), len(quick_values))
+                if n < 2:
+                    continue
+                lower_values = next((values for values in lowers if len(values) >= n), None)
+                table: List[List[float]] = []
+                previous_upper = 0.0
+                for index in range(n):
+                    lower = lower_values[index] if lower_values is not None else previous_upper + (0.0 if index == 0 else 1.0)
+                    upper = upper_values[index]
+                    if index == n - 1 and upper <= previous_upper:
+                        upper = 999999999.0
+                    table.append([lower, upper, _normalise_rate(rate_values[index]), quick_values[index]])
+                    previous_upper = upper
+                if _valid_brackets(table):
+                    variants.append(table)
+
+    unique: List[List[List[float]]] = []
+    seen = set()
+    for table in variants:
+        key = tuple(tuple(round(value, 8) for value in row) for row in table)
+        if key not in seen:
+            seen.add(key)
+            unique.append(table)
+    return unique
 
 
 def _normalise_rate(rate: float) -> float:
@@ -654,9 +782,10 @@ def extract_parameter_candidates(
     texts = _candidate_texts_from_source(source)
     bracket_tables: List[List[List[float]]] = []
     for _context, text in texts:
-        rows = _numeric_rows(text)
+        rows = _numeric_rows(text) + _tax_rows_from_lines(text)
         if rows:
             bracket_tables.extend(_clean_brackets(rows))
+        bracket_tables.extend(_parallel_array_tables(text))
 
     unique_tables: List[List[List[float]]] = []
     seen_tables = set()

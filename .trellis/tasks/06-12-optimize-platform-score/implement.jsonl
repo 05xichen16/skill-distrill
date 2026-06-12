@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend spec entry point for this single-package Python project."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Quality expectations for backend code changes."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Error handling guidance for skill subprocesses and fallbacks."}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "Directory conventions for contest solution modules."}
+{"file": ".trellis/spec/guides/index.md", "reason": "Shared Trellis thinking guide index."}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Reminder to search and reuse existing parsing/helper patterns before editing multiple skills."}

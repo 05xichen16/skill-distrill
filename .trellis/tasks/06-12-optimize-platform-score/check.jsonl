@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend spec entry point for verification."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Quality expectations for tests and regression checks."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Check skill fallback behavior and non-crashing error paths."}
+{"file": ".trellis/spec/guides/index.md", "reason": "Shared Trellis thinking guide index."}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Verify changes reuse existing patterns and avoid duplicated parsing logic."}

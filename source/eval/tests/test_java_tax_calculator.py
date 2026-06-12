@@ -186,6 +186,51 @@ public class TaxVariant {
         )
         self.assertEqual(outputs, [_expected_tax(s) for s in self.module.hidden_salaries(TASK_TEXT)])
 
+    def test_comment_markdown_table_validate(self) -> None:
+        source = """
+public class TaxVariant {
+  // 起征点为 5000 元
+  // | 应纳税所得额范围 | 税率 | 速算扣除数 |
+  // | 不超过3000元 | 3% | 0 |
+  // | 超过3000至12000元 | 10% | 410 |
+  // | 超过12000至25000元 | 20% | 2660 |
+  // | 超过25000至35000元 | 25% | 4410 |
+  // | 超过35000至55000元 | 30% | 7160 |
+  // | 超过55000至80000元 | 35% | 15160 |
+  // | 超过80000元以上 | 45% | 15310 |
+}
+"""
+        warnings: list = []
+        outputs, _ = self.module.try_python_path(
+            None,
+            source,
+            self.module.parse_examples(TASK_TEXT),
+            self.module.hidden_salaries(TASK_TEXT),
+            30,
+            warnings,
+        )
+        self.assertEqual(outputs, [_expected_tax(s) for s in self.module.hidden_salaries(TASK_TEXT)])
+
+    def test_parallel_tax_arrays_validate(self) -> None:
+        source = """
+public class TaxVariant {
+  static final int DEDUCTION_POINT = 5000;
+  static final double[] upperLimits = {3000, 12000, 25000, 35000, 55000, 80000, 999999999};
+  static final double[] taxRates = {3, 10, 20, 25, 30, 35, 45};
+  static final double[] quickDeductions = {0, 410, 2660, 4410, 7160, 15160, 15310};
+}
+"""
+        warnings: list = []
+        outputs, _ = self.module.try_python_path(
+            None,
+            source,
+            self.module.parse_examples(TASK_TEXT),
+            self.module.hidden_salaries(TASK_TEXT),
+            30,
+            warnings,
+        )
+        self.assertEqual(outputs, [_expected_tax(s) for s in self.module.hidden_salaries(TASK_TEXT)])
+
 
 class JavaPathTest(unittest.TestCase):
     """Repair loop with a mocked toolchain: compile error -> feedback -> success."""
