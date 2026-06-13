@@ -96,6 +96,20 @@ class ParsingTest(unittest.TestCase):
             [5000, 12000, 25000, 35000, 55000, 60000, 80000, 90000, 150000, 500000],
         )
 
+    def test_hidden_salaries_keeps_short_numbers(self) -> None:
+        # A variant may use 1-3 digit salaries; they must not be dropped, or the
+        # answer misaligns against the position-wise grader.
+        text = "【隐藏用例】（对应4个输出）\n800\n999\n5000\n12000\n"
+        self.assertEqual(
+            self.module.hidden_salaries(text),
+            [800, 999, 5000, 12000],
+        )
+
+    def test_hidden_salaries_excludes_example_and_prose_lines(self) -> None:
+        # Without a marker, "X -> Y" example rows and prose must not be matched.
+        text = "3000 -> 0.00\n8000 -> 90.00\nsome prose 123 here\n"
+        self.assertEqual(self.module.hidden_salaries(text), list(self.module.DEFAULT_SALARIES))
+
     def test_parse_class_name(self) -> None:
         self.assertEqual(
             self.module.parse_class_name("public class JavaSource_7_1 {"), "JavaSource_7_1"
@@ -130,6 +144,69 @@ class PublicDecodePathTest(unittest.TestCase):
         )
         self.assertIsNotNone(outputs)
         self.assertEqual(outputs, [_expected_tax(s) for s in salaries])
+
+
+class VariableDepthEncodingTest(unittest.TestCase):
+    """decode_encoded_constant must peel however many base64 layers a variant uses.
+
+    The public set uses 3 layers; a hidden variant was observed using 4, which
+    left the old fixed-depth decode_triple with base64 garbage ('NDAwMA==') and
+    crashed the deduction to its heuristic default (5000 instead of 4000).
+    """
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    @staticmethod
+    def _encode_layers(plaintext: str, layers: int) -> str:
+        data = plaintext
+        for _ in range(layers):
+            data = base64.b64encode(data.encode("utf-8")).decode("ascii")
+        return data
+
+    def test_float_constant_various_depths(self) -> None:
+        for layers in (1, 2, 3, 4, 6):
+            encoded = self._encode_layers("4000", layers)
+            self.assertEqual(
+                self.module.decode_encoded_constant(encoded, float),
+                4000.0,
+                msg="depth %d" % layers,
+            )
+
+    def test_json_constant_various_depths(self) -> None:
+        table = [[0, 3000, 0.03, 0], [3001, 12000, 0.1, 410]]
+        for layers in (1, 3, 4, 5):
+            encoded = self._encode_layers(json.dumps(table), layers)
+            self.assertEqual(
+                self.module.decode_encoded_constant(encoded, json.loads),
+                table,
+                msg="depth %d" % layers,
+            )
+
+    def test_does_not_overdecode_plaintext(self) -> None:
+        # '5000' is itself valid base64; parse-first must return 5000.0 rather
+        # than keep decoding it into raw bytes.
+        self.assertEqual(self.module.decode_encoded_constant("5000", float), 5000.0)
+
+    def test_four_layer_deduction_variant_decodes(self) -> None:
+        # The exact regression shape: a 4-layer deduction beside a 3-layer table.
+        brackets = [[0, 3000, 0.03, 0], [3001, 999999999, 0.1, 210]]
+        source = (
+            "public class T {\n"
+            '  static final String DEDUCTION_POINT_ENCODED = "%s";\n'
+            '  static final String TAX_BRACKETS_ENCODED = "%s";\n'
+            "}\n"
+        ) % (
+            self._encode_layers("4000", 4),
+            self._encode_layers(json.dumps(brackets), 3),
+        )
+        deduction, decoded = self.module.decode_parameters(source)
+        self.assertEqual(deduction, 4000.0)
+        self.assertEqual(decoded[0][1], 3000.0)
+
+    def test_unparseable_constant_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            self.module.decode_encoded_constant("not base64 and not a number !!", float)
 
 
 class GenericParameterExtractionTest(unittest.TestCase):

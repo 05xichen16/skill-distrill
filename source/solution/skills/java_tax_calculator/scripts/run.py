@@ -167,7 +167,12 @@ def read_text(path: str) -> str:
 def hidden_salaries(task_description: str) -> List[int]:
     marker = "隐藏用例"
     tail = task_description.split(marker, 1)[1] if marker in task_description else task_description
-    numbers = [int(item) for item in re.findall(r"(?m)^\s*(\d{4,})\s*$", tail)]
+    # One salary per line in the hidden-case block. Match any-length integer
+    # (anchored to a whole line), not just 4+ digits: a variant may use a 3-digit
+    # salary like 800/999, and dropping it would shorten/misalign the answer
+    # against this position-wise grader. The whole-line anchor still excludes the
+    # "X -> Y" example rows and the prose marker line.
+    numbers = [int(item) for item in re.findall(r"(?m)^\s*(\d+)\s*$", tail)]
     return numbers or list(DEFAULT_SALARIES)
 
 
@@ -526,11 +531,45 @@ def try_java_path(
 
 # --- python fallback -----------------------------------------------------------
 
-def decode_triple(value: str) -> str:
-    text = value
-    for _ in range(3):
-        text = base64.b64decode(text).decode("utf-8")
-    return text
+def _b64_decode_layer(text: str) -> Optional[str]:
+    """Strictly decode one base64 layer, or None if `text` is not base64/utf-8."""
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) < 4:
+        return None
+    padded = compact + ("=" * ((4 - len(compact) % 4) % 4))
+    try:
+        return base64.b64decode(padded, validate=True).decode("utf-8").strip()
+    except Exception:
+        return None
+
+
+def decode_encoded_constant(value: str, parse: Any, max_rounds: int = 8) -> Any:
+    """Peel repeated base64 layers until ``parse`` accepts the plaintext.
+
+    The public set wraps each constant (the deduction point, the bracket table)
+    in THREE base64 layers -- but the layer *count* is part of what hidden
+    variants change: one observed variant encoded the deduction in FOUR. A fixed
+    three-layer ``decode_triple`` then stopped on base64 garbage like
+    ``'NDAwMA=='`` (= ``base64('4000')``) that ``float`` / ``json.loads`` could
+    not parse, crashing the decode path into the heuristic fallback and a wrong
+    deduction (5000 instead of 4000), zeroing the tax segments on that variant.
+
+    Peeling adaptively fixes that. Trying ``parse`` *before* each decode (rather
+    than always decoding a fixed depth) also stops us from over-decoding a
+    plaintext that itself happens to look like base64 (e.g. ``"5000"``).
+    """
+    text = value.strip()
+    last_error: Optional[Exception] = None
+    for _ in range(max_rounds + 1):
+        try:
+            return parse(text)
+        except Exception as exc:  # parse not satisfied yet; peel another layer
+            last_error = exc
+        decoded = _b64_decode_layer(text)
+        if decoded is None or decoded == text:
+            break
+        text = decoded
+    raise ValueError("could not decode encoded constant: %s" % last_error)
 
 
 _STRING_LITERAL_RE = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
@@ -862,8 +901,8 @@ def decode_parameters(source: str) -> Tuple[float, List[List[float]]]:
     tax_match = re.search(r"TAX_BRACKETS_ENCODED\s*=\s*\"([^\"]+)\"", source)
     deduction_match = re.search(r"DEDUCTION_POINT_ENCODED\s*=\s*\"([^\"]+)\"", source)
     if tax_match and deduction_match:
-        deduction = float(decode_triple(deduction_match.group(1)))
-        brackets = json.loads(decode_triple(tax_match.group(1)))
+        deduction = float(decode_encoded_constant(deduction_match.group(1), float))
+        brackets = decode_encoded_constant(tax_match.group(1), json.loads)
         return deduction, [[float(item) for item in row] for row in brackets]
 
     candidates = extract_parameter_candidates(source, [])
