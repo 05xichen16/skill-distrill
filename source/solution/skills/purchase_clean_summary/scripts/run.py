@@ -21,6 +21,17 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 # well-formed answer BEFORE that kill. None = no ceiling (offline unit tests).
 _MODEL_DEADLINE: Optional[float] = None
 
+# OCR outcome counters for one answer() call (this is a single-shot subprocess,
+# so a module global is reset per run). They feed the ``diag`` block in the
+# return so the router can log, from the platform, WHY the amounts came out as
+# they did: OCR that all failed/skipped -> empty evidence -> dropped/wrong POs.
+_OCR_STATS: Dict[str, int] = {"attempts": 0, "ok": 0, "empty": 0, "error": 0, "skipped": 0}
+
+
+def _reset_ocr_stats() -> None:
+    for key in _OCR_STATS:
+        _OCR_STATS[key] = 0
+
 
 def _deadline_reached() -> bool:
     return _MODEL_DEADLINE is not None and time.monotonic() >= _MODEL_DEADLINE
@@ -609,11 +620,15 @@ def load_evidence_texts(
                 # the deterministic baseline (system fields + text evidence) is a
                 # far better partial score than surrendering the whole question.
                 if do_ocr and not _deadline_reached():
+                    _OCR_STATS["attempts"] += 1
                     try:
                         text = ocr_reader(path) or ""
+                        _OCR_STATS["ok" if text else "empty"] += 1
                     except Exception:  # noqa: BLE001 - never let OCR kill the run
+                        _OCR_STATS["error"] += 1
                         text = ""
                 else:
+                    _OCR_STATS["skipped"] += 1
                     text = ""
             else:
                 try:
@@ -998,6 +1013,7 @@ def answer(
     budget = _env_int("SKILL_BUDGET_SECONDS", 900, minimum=30)
     reserve = _env_int("AGENT_DEMO_SKILL_RESERVE_SECONDS", 120, minimum=15)
     _MODEL_DEADLINE = time.monotonic() + max(15, budget - reserve)
+    _reset_ocr_stats()
 
     missing = [t for t in (TABLE_QUERIES, TABLE_VENDORS, TABLE_TAXONOMY) if t not in tables]
     if missing:
@@ -1105,7 +1121,27 @@ def answer(
             output.append("0")
             continue
         output.append(str(totals[(query.get("vendor_id", ""), query.get("category_code", ""))]))
-    return {"answer": ",".join(output), "included": included, "rescued": rescued}
+    # Diagnostics for the platform log (no question/source content): the join
+    # population, how many POs were code-accepted vs dropped vs LLM-rescued, and
+    # the OCR outcome breakdown. All-zero/failed OCR with many dropped POs is the
+    # 2_1 degradation signature.
+    diag = {
+        "pos": len(pos),
+        "queries": len(queries),
+        "included": len(included),
+        "dropped": len(dropped),
+        "rescued": len(rescued),
+        "ocr": dict(_OCR_STATS),
+        "do_ocr": do_ocr,
+        "model": config is not None,
+        "deadline_hit": _deadline_reached(),
+    }
+    return {
+        "answer": ",".join(output),
+        "included": included,
+        "rescued": rescued,
+        "diag": diag,
+    }
 
 
 def _emergency_query_count(args: Dict[str, Any]) -> Optional[int]:

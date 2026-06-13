@@ -215,9 +215,25 @@ class ContestantAgent:
             self._diag(f"skill {skill_name} result (non-dict) {self._answer_preview(str(result))}")
             return
         summary: dict[str, Any] = {}
-        for key in ("path", "n", "unjudged", "failed", "error"):
+        # Scalar/dict diagnostic fields emitted by the various skills:
+        #   path/n/unjudged/error        — generic
+        #   diag                         — purchase_clean_summary (2_1): OCR + join counts
+        #   images_total/images_ocr_ok/breakdown/text_files — sensitive_scan (2_2)
+        for key in (
+            "path", "n", "unjudged", "error", "diag",
+            "images_total", "images_ocr_ok", "breakdown", "text_files",
+        ):
             if key in parsed:
                 summary[key] = parsed[key]
+        # List fields: keep the short, position-meaningful ``failed`` ids; reduce
+        # the potentially long included/rescued id lists to counts.
+        failed = parsed.get("failed")
+        if isinstance(failed, list):
+            summary["failed"] = failed[:25] if len(failed) <= 25 else f"[{len(failed)} ids]"
+        for key in ("included", "rescued"):
+            value = parsed.get(key)
+            if isinstance(value, list):
+                summary[key + "_n"] = len(value)
         per_case = parsed.get("per_case")
         if isinstance(per_case, list):
             judged = sum(1 for case in per_case if isinstance(case, dict) and case.get("judged"))
@@ -230,7 +246,7 @@ class ContestantAgent:
         preview = self._answer_preview("" if answer_value is None else str(answer_value))
         self._diag(
             f"skill {skill_name} result "
-            f"{json.dumps(summary, ensure_ascii=False)[:900]} answer={preview}"
+            f"{json.dumps(summary, ensure_ascii=False)[:2000]} answer={preview}"
         )
 
     async def _try_explicit_skill_route(
