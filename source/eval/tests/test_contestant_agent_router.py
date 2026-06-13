@@ -263,13 +263,29 @@ class ContestantAgentRouterTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(route)
 
-    async def test_java_tax_inprocess_fallback_when_skill_route_dies(self) -> None:
-        """If skill_run raises (e.g. the subprocess is killed on timeout — the
-        exact-zero mechanism), solve() must still return a correct, version-
-        prefixed answer computed in-process, never the version-less model loop.
+    _PUBLIC_HIDDEN_TAXES = [
+        "0.00", "290.00", "1340.00", "3090.00", "7840.00", "9340.00",
+        "11090.00", "22940.00", "49940.00", "207440.00",
+    ]
+
+    @property
+    def _public_source(self) -> Path:
+        return (
+            Path(__file__).resolve().parents[3]
+            / "publish" / "publish_V1" / "JavaSource_7_1.java"
+        )
+
+    _TASK_TEXT = (
+        "隐藏用例\n5000\n12000\n25000\n35000\n55000\n60000\n80000\n90000\n150000\n500000"
+    )
+
+    async def test_java_tax_solved_in_process_before_any_skill_call(self) -> None:
+        """The Java tax answer is computed deterministically IN-PROCESS as the
+        primary path: even a skill whose ``skill_run`` would crash is never
+        reached, so the exact-zero model-loop path can never claim this question.
         """
-        # The model loop is disabled, so any answer here PROVES it came from the
-        # deterministic in-process fallback, not the model.
+        # Model loop disabled, so a correct answer PROVES it came from the
+        # deterministic in-process computation, not the model.
         os.environ["AGENT_DEMO_USE_LLM"] = "false"
 
         class _DyingContext(_StubContext):
@@ -277,29 +293,47 @@ class ContestantAgentRouterTest(unittest.IsolatedAsyncioTestCase):
                 self.calls.append((name, args))
                 raise RuntimeError("skill subprocess killed (timeout)")
 
-        public_source = (
-            Path(__file__).resolve().parents[3]
-            / "publish" / "publish_V1" / "JavaSource_7_1.java"
-        )
-        task_text = "隐藏用例\n5000\n12000\n25000\n35000\n55000\n60000\n80000\n90000\n150000\n500000"
-        context = _DyingContext(allowed_file_paths=[str(public_source)])
+        context = _DyingContext(allowed_file_paths=[str(self._public_source)])
         answer = await self.agent.solve(
             question={
                 "title": "Java个人所得税计算器",
-                "question": task_text,
-                "files": [str(public_source)],
+                "question": self._TASK_TEXT,
+                "files": [str(self._public_source)],
             },
             context=context,
         )
-        self.assertEqual(context.calls[0][0], "skill_run")  # the route was attempted
+        # In-process leads: the (dying) skill subprocess is never even invoked.
+        self.assertEqual(context.calls, [])
         segments = answer.split(",")
         self.assertEqual(len(segments), 11)
         self.assertIn("21.0.11", segments[0])
-        self.assertEqual(
-            segments[1:],
-            ["0.00", "290.00", "1340.00", "3090.00", "7840.00", "9340.00",
-             "11090.00", "22940.00", "49940.00", "207440.00"],
+        self.assertEqual(segments[1:], self._PUBLIC_HIDDEN_TAXES)
+
+    async def test_java_tax_solved_even_when_skill_not_discovered(self) -> None:
+        """The exact-zero failure mode: the skill is NOT in available_skills, so
+        the explicit route never fires. solve() must still answer correctly from
+        the in-process path instead of surrendering to the version-less model
+        loop (which would score 0 on the match2 grader).
+        """
+        os.environ["AGENT_DEMO_USE_LLM"] = "false"
+        # available_skills deliberately omits java_tax_calculator.
+        context = _StubContext(
+            skills=["spec_qa", "sensitive_scan"],
+            allowed_file_paths=[str(self._public_source)],
         )
+        answer = await self.agent.solve(
+            question={
+                "title": "Java个人所得税计算器",
+                "question": self._TASK_TEXT,
+                "files": [str(self._public_source)],
+            },
+            context=context,
+        )
+        self.assertEqual(context.calls, [])  # no skill route possible, none attempted
+        segments = answer.split(",")
+        self.assertEqual(len(segments), 11)
+        self.assertIn("21.0.11", segments[0])
+        self.assertEqual(segments[1:], self._PUBLIC_HIDDEN_TAXES)
 
 
 if __name__ == "__main__":

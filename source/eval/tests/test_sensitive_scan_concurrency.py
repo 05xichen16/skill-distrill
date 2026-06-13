@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import os
 import threading
 import time
 import unittest
@@ -50,6 +51,8 @@ def _archive_with_images(count: int) -> bytes:
 
 class SensitiveScanConcurrencyTest(unittest.TestCase):
     def setUp(self) -> None:
+        os.environ["SENSITIVE_SCAN_RETRY_BACKOFF"] = "0"  # keep retry tests fast
+        self.addCleanup(os.environ.pop, "SENSITIVE_SCAN_RETRY_BACKOFF", None)
         self.module = _load_skill_module()
         # Pretend the gateway is configured; extract_image_counts is mocked per-test.
         self.module._model_config = lambda: {
@@ -60,7 +63,7 @@ class SensitiveScanConcurrencyTest(unittest.TestCase):
         }
 
     def _scan(self, archive_bytes: bytes, tmp_name: str):
-        import tempfile, os
+        import tempfile
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = os.path.join(tmp_dir, tmp_name)
@@ -107,6 +110,31 @@ class SensitiveScanConcurrencyTest(unittest.TestCase):
         self.assertTrue(any("img_1.png" in w for w in result["warnings"]))
         # text counts survive regardless of the broken image
         self.assertEqual(result["breakdown"]["text"][0], 1)
+
+    def test_deadline_emits_text_answer_instead_of_hanging(self) -> None:
+        # The single most important reliability guarantee: if OCR cannot finish
+        # within the runner's kill budget, the skill must still return a
+        # well-formed text answer fast (a dropped stdout forces the version-less
+        # model loop). Here OCR "hangs" but a near-past deadline cuts it off.
+        def hang_extract(config, name, data, timeout):
+            time.sleep(5.0)
+            return {"phone": 9, "email": 9, "id": 9, "key": 9}
+
+        self.module.extract_image_counts = hang_extract
+        self.module._ocr_deadline = lambda start: time.monotonic() + 0.3
+
+        started = time.monotonic()
+        result = self._scan(_archive_with_images(4), "deadline.zip")
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 3.0)  # did NOT wait for the 5s hangs
+        # text counts survive; image counts contributed nothing past the deadline
+        self.assertEqual(result["breakdown"]["text"][0], 1)  # note.txt phone
+        self.assertEqual(result["images_ocr_ok"], 0)
+        self.assertEqual(result["breakdown"]["image"], [0, 0, 0, 0])
+        self.assertTrue(any("deadline" in w for w in result["warnings"]))
+        # a valid 4-field answer is still produced
+        self.assertEqual(len(result["answer"].split(",")), 4)
 
     def test_retry_recovers_flaky_image(self) -> None:
         attempts = {}

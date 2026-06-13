@@ -6,22 +6,27 @@ description: Scan a nested archive (zip/tar, multi-level) for sensitive data cou
 # sensitive_scan
 
 Use this skill for the "compressed-archive sensitive information scan" question
-(e.g. `sensitive_data_2_1.zip`). It does the heavy lifting deterministically:
+(e.g. `sensitive_data_2_1.zip`). It does the heavy lifting deterministically and
+is hardened for the platform variant (same question text, different data):
 
-1. Resolves and extracts the archive, recursing through nested `.tar` / `.zip`
-   members (archives are detected by content, not just extension).
-2. Counts sensitive items in every `.txt` / `.log` file with boundary-aware
-   regex (total occurrences, NOT deduplicated):
+1. Resolves and extracts the archive, recursing through nested `.zip`, `.tar`
+   AND compressed members (`.tar.gz` / `.tgz` / `.gz` / `.bz2` / `.xz`).
+   Containers are detected by content magic, not just extension.
+2. Counts sensitive items in EVERY non-archive, non-image file (not only
+   `.txt`/`.log` — the question says the archive may contain those file types
+   "etc.") with boundary-aware regex (total occurrences, NOT deduplicated):
    - phone: an `1`-led 11-digit number, bounded so it never matches a substring
      inside an 18-digit ID number
-   - email: `user@domain.com`
+   - email: `user@domain.<tld>` for any TLD (not only `.com`)
    - ID card: 18 chars, 17 digits plus a trailing digit or `X`
    - API key: an `sk-` prefixed token
-3. For images, asks the multimodal model to extract structured sensitive-token
-   lists (`phones`, `emails`, `ids`, `api_keys`) directly, then validates those
-   items in code before counting. If the model is not configured or the call
-   fails, image extraction is skipped gracefully and the text-only counts are
-   returned with a warning (the skill never crashes).
+3. For images (detected by extension or content magic), asks the multimodal
+   model to transcribe ALL visible text verbatim, then counts tokens with the
+   SAME regex used for text files — so image counts obey identical rules. If the
+   model is unconfigured or a call fails, that image is skipped with a warning
+   and the rest of the scan still returns (the skill never crashes). A
+   wall-clock deadline (from `SKILL_BUDGET_SECONDS`) guarantees a well-formed
+   answer is emitted before the runner's kill timeout.
 
 ## How to call
 
