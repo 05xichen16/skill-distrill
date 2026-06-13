@@ -44,6 +44,24 @@ class ContestantAgent:
     async def solve(self, *, question: dict[str, Any], context: AgentContext) -> str:
         load_dotenv()
 
+        # Entry trace: question id + the discovery surface this run actually saw.
+        # ``available_skills`` is decisive for the exact-zero failure mode — if a
+        # task's dedicated skill is absent here, no explicit route can fire and
+        # solve() falls to the version-less model loop. Filenames/skill names are
+        # metadata, not the forbidden question prose.
+        qid = str(question.get("id") or "")
+        try:
+            skill_names = sorted(self._available_skill_names(context))
+            basenames = sorted({self._basename(path) for path in self._question_files(question)})
+            n_tools = len(getattr(context, "available_tools", []) or [])
+            n_agents = len(getattr(context, "available_agents", []) or [])
+            self._diag(
+                f"solve start id={qid!r} files={basenames} available_skills={skill_names} "
+                f"tools={n_tools} agents={n_agents}"
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never break solve()
+            self._diag(f"solve start id={qid!r} (entry diag partial: {exc})")
+
         # 2_3 (Java 个人所得税计算器): compute the answer deterministically
         # IN-PROCESS as the PRIMARY path, gated only on the question content —
         # never on whether the skill was surfaced in available_skills, the skill
@@ -60,31 +78,35 @@ class ContestantAgent:
         # exact on the natural variant (which changes the encoded table/deduction
         # values, not their format), so it must lead for this question.
         java_args = self._java_tax_request(question, context)
+        self._diag(f"java_tax detect matched={java_args is not None}")
         if java_args is not None:
             deterministic = self._java_tax_inprocess(java_args, context)
             if deterministic is not None:
+                self._diag(f"return via=java_tax_inprocess {self._answer_preview(deterministic)}")
                 return deterministic
+            self._diag("java_tax_inprocess produced no usable answer; continuing to route/model loop")
 
         # Compute the route first so the skill name survives a skill failure:
         # the model loop's final answer is then held to the same shape guard.
         route = self._explicit_skill_route(question=question, context=context)
         routed_skill = route[0] if route is not None else None
+        self._diag(f"explicit route={routed_skill!r}")
         if route is not None:
             routed = await self._try_explicit_skill_route(question=question, context=context, route=route)
             if routed is not None:
+                self._diag(f"return via=skill:{routed_skill} {self._answer_preview(routed)}")
                 return routed
             # The skill route was detected but did not produce an answer (skill
             # subprocess killed/timed out, MCP error, guard rejection...). For
             # deterministic-computable tasks, compute the answer in-process
             # before surrendering to the version-less model loop, which scores an
             # exact zero on 2_3's match2 grader.
+            self._diag(f"skill route {routed_skill} produced no answer (see prior diag for why)")
             if routed_skill == "java_tax_calculator":
                 deterministic = self._java_tax_inprocess(route[1], context)
                 if deterministic is not None:
-                    print(
-                        "java_tax_calculator: skill route produced no answer; "
-                        "using deterministic in-process fallback",
-                        file=sys.stderr,
+                    self._diag(
+                        f"return via=java_tax_inprocess(after-route) {self._answer_preview(deterministic)}"
                     )
                     return deterministic
 
@@ -109,8 +131,13 @@ class ContestantAgent:
             ensure_ascii=False,
             indent=2,
         )
-        user_content = self._compose_content(text_prompt, self._image_blocks(context))
+        image_blocks = self._image_blocks(context)
+        user_content = self._compose_content(text_prompt, image_blocks)
         enable_thinking = self._should_enable_thinking(question)
+        self._diag(
+            f"entering model_loop routed_skill={routed_skill!r} thinking={enable_thinking} "
+            f"images={len(image_blocks)}"
+        )
 
         try:
             answer = await self._run_model_loop(
@@ -121,17 +148,89 @@ class ContestantAgent:
             )
         except Exception as exc:  # last-resort safety net: never return an empty answer
             print(f"agent loop failed, falling back to direct answer: {exc}", file=sys.stderr)
+            self._diag(f"model_loop raised: {str(exc)[:300]}; using direct_answer fallback")
             answer = await self._direct_answer(user_content, enable_thinking=enable_thinking)
 
         if routed_skill is None:
+            self._diag(f"return via=model_loop {self._answer_preview(answer)}")
             return answer
         # The model loop replaced a known skill: its output must satisfy the
         # same shape guard, otherwise bare CoT/truncation garbage gets submitted.
-        return await self._guarded_model_answer(
+        guarded = await self._guarded_model_answer(
             answer,
             skill_name=routed_skill,
             user_content=user_content,
             enable_thinking=enable_thinking,
+        )
+        self._diag(f"return via=model_loop+guard:{routed_skill} {self._answer_preview(guarded)}")
+        return guarded
+
+    # --- platform diagnostics --------------------------------------------------
+    # The contest forbids echoing the QUESTION/file contents, but routing/shape
+    # metadata is fair game and is the only way to see, from the platform logs,
+    # which path produced each answer. Everything below logs ONLY: question id,
+    # available skill/tool names, which branch fired, and OUR answer's
+    # length/head — never the question prose or attachment contents. On by
+    # default; mute with AGENT_DEMO_DIAG=0.
+
+    def _diag(self, msg: str) -> None:
+        """Emit one grep-friendly ``[AGENT_DIAG]`` trace line to stderr.
+
+        Flushed immediately so a later subprocess/budget kill cannot lose the
+        line (the exact-zero failure mode is a dropped answer; a dropped log is
+        just as blinding).
+        """
+        if not env_bool("AGENT_DEMO_DIAG", True):
+            return
+        try:
+            print(f"[AGENT_DIAG] {msg}", file=sys.stderr, flush=True)
+        except Exception:  # noqa: BLE001 - logging must never break solve()
+            pass
+
+    def _answer_preview(self, answer: str) -> str:
+        """A safe one-line preview of OUR answer (never the question)."""
+        text = str(answer)
+        flat = text.replace("\r", " ").replace("\n", "\\n")
+        return f"len={len(text)} head={flat[:100]!r}"
+
+    def _diag_skill_result(self, skill_name: str, result: Any) -> None:
+        """Log a skill's returned diagnostic fields (path/warnings/counts).
+
+        Skills emit rich diagnostics (warnings, per_case, path, unjudged) inside
+        their JSON result, but solve() consumes only ``answer`` and the skill
+        subprocess's stderr is discarded on the exit-0 success path
+        (skill_runtime.run_skill returns stdout only). Surfacing these fields is
+        the single best window into WHY a skill produced the answer it did on the
+        platform — e.g. 2_3's tax segments came from a real decode vs the all-zero
+        shape fallback, or 1_4's cases were judged vs unjudgeable.
+        """
+        if not env_bool("AGENT_DEMO_DIAG", True):
+            return
+        if isinstance(result, dict):
+            parsed: Any = result
+        else:
+            text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+            parsed = self._parse_json_object(text)
+        if not isinstance(parsed, dict):
+            self._diag(f"skill {skill_name} result (non-dict) {self._answer_preview(str(result))}")
+            return
+        summary: dict[str, Any] = {}
+        for key in ("path", "n", "unjudged", "failed", "error"):
+            if key in parsed:
+                summary[key] = parsed[key]
+        per_case = parsed.get("per_case")
+        if isinstance(per_case, list):
+            judged = sum(1 for case in per_case if isinstance(case, dict) and case.get("judged"))
+            passed = sum(1 for case in per_case if isinstance(case, dict) and case.get("passed"))
+            summary["per_case"] = f"{len(per_case)}/judged={judged}/passed={passed}"
+        warnings = parsed.get("warnings")
+        if isinstance(warnings, list) and warnings:
+            summary["warnings"] = [str(item)[:200] for item in warnings[-6:]]
+        answer_value = parsed.get("answer")
+        preview = self._answer_preview("" if answer_value is None else str(answer_value))
+        self._diag(
+            f"skill {skill_name} result "
+            f"{json.dumps(summary, ensure_ascii=False)[:900]} answer={preview}"
         )
 
     async def _try_explicit_skill_route(
@@ -165,19 +264,23 @@ class ContestantAgent:
                 },
             )
         except Exception as exc:
-            print(f"explicit skill route failed for {skill_name}: {exc}", file=sys.stderr)
+            # The skill subprocess crashed (non-zero exit, kill, MCP error). The
+            # exception text carries the subprocess's stderr — for interface_test
+            # that is the RuntimeError detail (base_url underivable / service
+            # unreachable / degraded-output), the decisive 1_4 signal.
+            self._diag(f"skill {skill_name} skill_run raised: {str(exc)[:600]}")
             return None
 
+        self._diag_skill_result(skill_name, result)
         answer = self._extract_skill_answer(result)
         if answer is None:
-            print(f"explicit skill route {skill_name} returned no answer field", file=sys.stderr)
+            self._diag(f"skill {skill_name} returned no answer field; falling back to model loop")
             return None
         rejection = self._skill_answer_guard(skill_name, answer)
         if rejection is not None:
-            print(
-                f"explicit skill route {skill_name} rejected by answer guard ({rejection}); "
-                "falling back to the model loop",
-                file=sys.stderr,
+            self._diag(
+                f"skill {skill_name} rejected by answer guard ({rejection}); "
+                f"falling back to model loop {self._answer_preview(answer)}"
             )
             return None
         return answer
@@ -216,12 +319,35 @@ class ContestantAgent:
             )
             result = module.emergency_answer(args, "router in-process fallback")
             answer = str((result or {}).get("answer") or "").strip()
+            # Decisive 2_3 signal: are the tax segments REAL (decoded/extracted)
+            # or did extraction fail and leave the all-zero shape fallback? If
+            # this fires and the version segment is present, the answer DID reach
+            # solve()'s return — so a platform exact-zero would mean the grader
+            # gives no partial credit for the version, not an orchestration drop.
+            if isinstance(result, dict):
+                segments = answer.split(",")
+                tax_segments = segments[1:] if len(segments) > 1 else []
+                nonzero = sum(
+                    1 for seg in tax_segments if seg.strip() not in ("", "0.00", "0", "0.0")
+                )
+                self._diag(
+                    f"java_tax inprocess detail={result.get('emergency_detail')!r} "
+                    f"version_seg={(segments[0] if segments else '')!r} "
+                    f"tax_segs={len(tax_segments)} nonzero={nonzero} "
+                    f"warnings={[str(w)[:160] for w in (result.get('warnings') or [])][-6:]} "
+                    f"error={str(result.get('error') or '')[:200]!r}"
+                )
         except Exception as exc:  # noqa: BLE001 - the safety net must never raise
-            print(f"java_tax in-process fallback failed: {exc}", file=sys.stderr)
+            self._diag(f"java_tax in-process fallback raised: {str(exc)[:300]}")
             return None
         if not answer:
+            self._diag("java_tax in-process produced an empty answer")
             return None
-        return answer if self._skill_answer_guard("java_tax_calculator", answer) is None else None
+        guard = self._skill_answer_guard("java_tax_calculator", answer)
+        if guard is not None:
+            self._diag(f"java_tax in-process answer rejected by guard ({guard})")
+            return None
+        return answer
 
     def _java_tax_request(
         self, question: dict[str, Any], context: AgentContext

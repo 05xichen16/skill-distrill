@@ -1113,6 +1113,14 @@ def emergency_answer(args: Dict[str, Any], error: str) -> Dict[str, Any]:
     """
     salaries = _best_effort_salaries(args)
     outputs = ["0.00" for _ in salaries]
+    # Collect the extraction warnings so the in-process router can log WHY the
+    # tax segments are what they are (real decode vs all-zero shape fallback) —
+    # the only window into 2_3's exact-zero failure mode from the platform logs.
+    warnings: List[str] = []
+    # ``path`` stays "emergency" (callers/tests rely on it); the validated /
+    # unvalidated / all-zero distinction goes in ``emergency_detail`` so the
+    # router can log whether the tax segments are real on the platform.
+    detail = "no-source"
     try:
         runtime = args.get("_runtime") if isinstance(args.get("_runtime"), dict) else {}
         source_path = resolve_source_file(str(args.get("source_file") or ""), runtime)
@@ -1121,19 +1129,28 @@ def emergency_answer(args: Dict[str, Any], error: str) -> Dict[str, Any]:
         # Offline only (config=None): no model/javac, just the deterministic
         # extraction. Either it validates and we get real taxes, or we keep the
         # decoded-but-unvalidated best parameters, or we stay on 0.00.
-        computed, best = try_python_path(None, source, examples, salaries, 5, [])
+        computed, best = try_python_path(None, source, examples, salaries, 5, warnings)
         if computed is not None:
             outputs = computed
+            detail = "validated"
         elif best is not None:
             deduction, brackets = best
             outputs = ["%.2f" % calculate_tax(s, deduction, brackets) for s in salaries]
-    except Exception:
-        pass
+            detail = "unvalidated-best"
+            warnings.append("emergency: using decoded-but-unvalidated best parameters")
+        else:
+            detail = "all-zero"
+            warnings.append("emergency: no tax parameters recovered; emitting version + zeros")
+    except Exception as exc:
+        detail = "exception"
+        warnings.append("emergency: %s: %s" % (type(exc).__name__, exc))
     return {
         "answer": ",".join([DEFAULT_JAVA_VERSION] + outputs),
         "n": len(outputs),
         "path": "emergency",
+        "emergency_detail": detail,
         "error": error,
+        "warnings": warnings,
     }
 
 
