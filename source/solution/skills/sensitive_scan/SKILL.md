@@ -28,16 +28,27 @@ is hardened for the platform variant (same question text, different data):
    wall-clock deadline (from `SKILL_BUDGET_SECONDS`) guarantees a well-formed
    answer is emitted before the runner's kill timeout.
 
+4. The set of sensitive categories AND their output order are read from the
+   question's `输出格式` line at runtime — NOT hardcoded. The public set asks for
+   exactly four (`手机号,邮箱,身份证,APIKey`) but the variant may add a type
+   (e.g. 银行卡号), and the grader is positional+exact, so emitting four numbers
+   when the variant wants five scores ~zero. The four known categories always
+   reuse the validated regexes (zero model calls, byte-identical); a genuinely
+   new category gets a model-synthesised detector, degrading to a 0 count that
+   keeps its position if the model is unavailable.
+
 ## How to call
 
 Call `skill_run` with:
 
 ```json
-{ "name": "sensitive_scan", "arguments": { "zip_path": "<the zip declared in the question>" } }
+{ "name": "sensitive_scan", "arguments": { "zip_path": "<the zip declared in the question>", "task_description": "<the question text, verbatim>" } }
 ```
 
 The runner injects the question directory automatically, so a relative
-`zip_path` (the name from the question's `files`) is enough.
+`zip_path` (the name from the question's `files`) is enough. Pass
+`task_description` (the verbatim question text) so the skill reads the output
+format / category list; if omitted it falls back to the four public categories.
 
 ## What to return
 
@@ -53,5 +64,8 @@ The skill prints JSON like:
 }
 ```
 
-**Return the `answer` field verbatim** as the final answer for the question
-(format: `phone,email,id,apikey`). Do not re-count or reformat it yourself.
+**Return the `answer` field verbatim** as the final answer for the question.
+The number of comma-separated counts follows the question's output-format line
+(four for the public set: `phone,email,id,apikey`; more if the variant adds a
+type). The `fields` array echoes the parsed category order for inspection. Do
+not re-count or reformat the answer yourself.

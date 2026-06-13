@@ -1,0 +1,1 @@
+{"file": ".trellis/tasks/archive/2026-06/06-12-optimize-platform-score/research/2_3-variant-findings.md", "reason": "复核基线：实现后公开集仍逐段满分(207440 等)、变种提取裁决段分不回退、版本段 contain[21.0.11] 仍命中、兜底不破坏'杀不掉必出答案'属性。"}

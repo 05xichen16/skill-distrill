@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import importlib.util
 import json
@@ -80,6 +81,18 @@ class ContestantAgent:
         java_args = self._java_tax_request(question, context)
         self._diag(f"java_tax detect matched={java_args is not None}")
         if java_args is not None:
+            # The model's ONLY job here: read the declared input salaries from the
+            # question text (strict JSON int array). Everything else — version,
+            # decoded table/deduction, calculate_tax, rounding — stays
+            # deterministic. A failed/invalid/timed-out extraction simply leaves
+            # ``salaries`` unset so the skill parses them deterministically; the
+            # in-process compute itself never depends on the gateway.
+            salaries = await self._extract_salaries_via_model(question, context)
+            if salaries:
+                java_args["salaries"] = salaries
+                self._diag(f"java_tax salaries via=model n={len(salaries)} head={salaries[:4]}")
+            else:
+                self._diag("java_tax salaries via=deterministic (model extract unavailable/rejected)")
             deterministic = self._java_tax_inprocess(java_args, context)
             if deterministic is not None:
                 self._diag(f"return via=java_tax_inprocess {self._answer_preview(deterministic)}")
@@ -249,7 +262,7 @@ class ContestantAgent:
         #   images_total/images_ocr_ok/breakdown/text_files — sensitive_scan (2_2)
         for key in (
             "path", "n", "unjudged", "error", "diag",
-            "images_total", "images_ocr_ok", "breakdown", "text_files",
+            "images_total", "images_ocr_ok", "breakdown", "text_files", "fields",
         ):
             if key in parsed:
                 summary[key] = parsed[key]
@@ -419,6 +432,93 @@ class ContestantAgent:
         except Exception as exc:  # noqa: BLE001 - detection must never crash solve()
             print(f"java_tax request detection failed: {exc}", file=sys.stderr)
             return None
+
+    _SALARY_EXTRACT_PROMPT = (
+        "下面是一道个人所得税计算题的题面。请只提取『需要计算个税的输入月薪』那一组数字，"
+        "严格按题面给出的顺序，不要包含示例(形如 3000 -> 0.00 的演示)里的输入，也不要版本号。\n"
+        "只输出一个 JSON 整数数组，例如 [5000,12000,25000]。"
+        "不要输出任何解释、文字、单位、代码块或多余字符。\n\n题面：\n{text}"
+    )
+
+    async def _extract_salaries_via_model(
+        self, question: dict[str, Any], context: AgentContext
+    ) -> list[int] | None:
+        """Extract ONLY the input salaries from the question text via the model.
+
+        Strict contract: the model returns a JSON array of positive integers in
+        the question's order; nothing else. The result feeds the deterministic
+        tax formula — the model never touches the table/deduction/rounding. Hard
+        timeout + every-failure-returns-None so a gateway storm or a malformed
+        reply transparently falls back to the deterministic ``hidden_salaries``;
+        this call must never block the in-process answer. Never raises.
+        """
+        if not env_bool("JAVA_TAX_SALARY_USE_MODEL", True):
+            return None
+        if not env_bool("AGENT_DEMO_USE_LLM", True):
+            return None
+        text = str(question.get("question") or "")
+        if not text.strip():
+            return None
+        try:
+            config = ModelConfig.from_env()
+            client = ChatCompletionClient(config)
+            prompt = self._SALARY_EXTRACT_PROMPT.format(text=text)
+            timeout = env_int("JAVA_TAX_SALARY_EXTRACT_TIMEOUT_SECONDS", 20)
+            completion = await asyncio.wait_for(
+                client.create(
+                    messages=[
+                        {"role": "system", "content": "你是严格的结构化抽取器，只输出题目要求的 JSON。"},
+                        {"role": "user", "content": prompt},
+                    ],
+                    tools=[],
+                    tool_choice="none",
+                    enable_thinking=False,
+                ),
+                timeout=max(5, timeout),
+            )
+            content = str(first_message(completion).get("content") or "")
+        except Exception as exc:  # noqa: BLE001 - extraction must never break solve()
+            self._diag(f"java_tax salary model extract failed: {str(exc)[:200]}")
+            return None
+        salaries = self._parse_salary_list(content)
+        if salaries is None:
+            self._diag(
+                f"java_tax salary model output rejected {self._answer_preview(content)}"
+            )
+        return salaries
+
+    def _parse_salary_list(self, content: str) -> list[int] | None:
+        """Parse a strict JSON int array from model output; sanity-check it.
+
+        Accepts a bare ``[...]`` (optionally inside think tags / fences). Rejects
+        anything that is not a non-empty list of positive integers of a plausible
+        count, so a hallucinated or malformed reply falls back to deterministic
+        parsing rather than poisoning every positional tax segment.
+        """
+        text = re.sub(r"<think>.*?</think>", "", content or "", flags=re.DOTALL)
+        match = re.search(r"\[[^\[\]]*\]", text, flags=re.DOTALL)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(0))
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(data, list) or not data:
+            return None
+        max_count = env_int("JAVA_TAX_SALARY_MAX_COUNT", 50)
+        if len(data) > max(1, max_count):
+            return None
+        salaries: list[int] = []
+        for item in data:
+            if isinstance(item, bool):  # bool is an int subclass; reject it
+                return None
+            if not isinstance(item, (int, float)):
+                return None
+            value = int(item)
+            if value != item or value <= 0:
+                return None
+            salaries.append(value)
+        return salaries
 
     def _purchase_inprocess(self, arguments: dict[str, Any], context: AgentContext) -> str | None:
         """Compute the purchase-clean-summary answer deterministically, in-process.
@@ -644,9 +744,14 @@ class ContestantAgent:
         return None
 
     def _guard_sensitive_scan(self, text: str) -> str | None:
+        # Shape: comma-separated non-negative integer counts. The arity is NOT
+        # fixed at 4 -- the platform variant may add a sensitive type, so the
+        # answer can be 4, 5, ... columns. Only the all-digits shape is enforced
+        # here (a model-loop fallback must not submit prose); the count itself is
+        # judged positionally by the grader.
         segments = [segment.strip() for segment in text.split(",")]
-        if len(segments) != 4 or not all(re.fullmatch(r"\d+", segment) for segment in segments):
-            return "answer is not 4 comma-separated counts"
+        if not segments or not all(re.fullmatch(r"\d+", segment) for segment in segments):
+            return "answer is not comma-separated integer counts"
         return None
 
     def _guard_purchase_clean_summary(self, text: str) -> str | None:
@@ -823,7 +928,10 @@ class ContestantAgent:
         ):
             zip_path = self._find_declared_file(files, (".zip",))
             if zip_path:
-                return "sensitive_scan", {"zip_path": zip_path}
+                # task_description carries the output-format line + category list;
+                # the skill reads it so a variant that adds a sensitive type is
+                # counted and emitted in the right position (vs. a hardcoded 4).
+                return "sensitive_scan", {"zip_path": zip_path, "task_description": question_text}
 
         if has("java_tax_calculator") and (
             "个人所得税" in text

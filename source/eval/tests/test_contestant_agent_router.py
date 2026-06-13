@@ -126,7 +126,12 @@ class ContestantAgentRouterTest(unittest.IsolatedAsyncioTestCase):
             },
             context=_StubContext(),
         )
-        self.assertEqual(route, ("sensitive_scan", {"zip_path": "sensitive_data_2_1.zip"}))
+        self.assertEqual(route[0], "sensitive_scan")
+        self.assertEqual(route[1]["zip_path"], "sensitive_data_2_1.zip")
+        # The description is plumbed so the skill can read the (possibly extended)
+        # category list + output order at runtime.
+        self.assertIn("task_description", route[1])
+        self.assertIsInstance(route[1]["task_description"], str)
 
     def test_date_normalize_route_uses_text_file(self) -> None:
         route = self.agent._explicit_skill_route(
@@ -425,6 +430,128 @@ class ContestantAgentRouterTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(context.calls, [])  # no purchase route possible, none attempted
         self.assertEqual(answer, expected)
+
+
+class JavaTaxSalaryExtractionTest(unittest.IsolatedAsyncioTestCase):
+    """2_3: the model extracts ONLY the input salaries (strict JSON int array);
+    the deterministic formula consumes them. A malformed/disabled/failed
+    extraction must transparently return None so the skill parses them
+    deterministically -- the model can never poison the positional tax segments
+    or block the in-process answer."""
+
+    def setUp(self) -> None:
+        self.agent = ContestantAgent()
+
+    # --- _parse_salary_list: strict contract -------------------------------
+    def test_parse_plain_array(self) -> None:
+        self.assertEqual(self.agent._parse_salary_list("[5000, 12000, 25000]"), [5000, 12000, 25000])
+
+    def test_parse_array_in_prose(self) -> None:
+        self.assertEqual(self.agent._parse_salary_list("结果：[5000,12000] 完成"), [5000, 12000])
+
+    def test_parse_strips_think_tags(self) -> None:
+        self.assertEqual(self.agent._parse_salary_list("<think>算一下</think>[800,900]"), [800, 900])
+
+    def test_parse_accepts_integral_floats(self) -> None:
+        self.assertEqual(self.agent._parse_salary_list("[5000.0, 12000.0]"), [5000, 12000])
+
+    def test_parse_rejects_non_array(self) -> None:
+        self.assertIsNone(self.agent._parse_salary_list("5000,12000"))
+
+    def test_parse_rejects_empty_array(self) -> None:
+        self.assertIsNone(self.agent._parse_salary_list("[]"))
+
+    def test_parse_rejects_nonintegral_float(self) -> None:
+        self.assertIsNone(self.agent._parse_salary_list("[5000.5]"))
+
+    def test_parse_rejects_negative(self) -> None:
+        self.assertIsNone(self.agent._parse_salary_list("[-5000]"))
+
+    def test_parse_rejects_bool(self) -> None:
+        self.assertIsNone(self.agent._parse_salary_list("[true, false]"))
+
+    def test_parse_rejects_too_many(self) -> None:
+        self.assertIsNone(self.agent._parse_salary_list("[" + ",".join(["1000"] * 100) + "]"))
+
+    # --- _extract_salaries_via_model: fallbacks + success ------------------
+    async def test_extract_disabled_by_flag(self) -> None:
+        os.environ["JAVA_TAX_SALARY_USE_MODEL"] = "0"
+        try:
+            result = await self.agent._extract_salaries_via_model(
+                {"question": "个人所得税 5000"}, _StubContext()
+            )
+        finally:
+            os.environ.pop("JAVA_TAX_SALARY_USE_MODEL", None)
+        self.assertIsNone(result)
+
+    async def test_extract_disabled_when_llm_off(self) -> None:
+        os.environ["AGENT_DEMO_USE_LLM"] = "false"
+        try:
+            result = await self.agent._extract_salaries_via_model(
+                {"question": "个人所得税 5000"}, _StubContext()
+            )
+        finally:
+            os.environ.pop("AGENT_DEMO_USE_LLM", None)
+        self.assertIsNone(result)
+
+    async def test_extract_empty_question(self) -> None:
+        self.assertIsNone(
+            await self.agent._extract_salaries_via_model({"question": ""}, _StubContext())
+        )
+
+    async def test_extract_success_parses_model_array(self) -> None:
+        import source.solution.contestant_agent as ca
+
+        class _FakeClient:
+            def __init__(self, config):
+                pass
+
+            async def create(self, **kwargs):
+                return {"choices": [{"message": {"content": "[5000, 12000, 25000]"}}]}
+
+        class _FakeConfig:
+            @staticmethod
+            def from_env():
+                return object()
+
+        old_client, old_config = ca.ChatCompletionClient, ca.ModelConfig
+        ca.ChatCompletionClient, ca.ModelConfig = _FakeClient, _FakeConfig
+        os.environ["AGENT_DEMO_USE_LLM"] = "true"
+        try:
+            result = await self.agent._extract_salaries_via_model(
+                {"question": "隐藏用例 5000 12000 25000"}, _StubContext()
+            )
+        finally:
+            ca.ChatCompletionClient, ca.ModelConfig = old_client, old_config
+            os.environ.pop("AGENT_DEMO_USE_LLM", None)
+        self.assertEqual(result, [5000, 12000, 25000])
+
+    async def test_extract_malformed_output_returns_none(self) -> None:
+        import source.solution.contestant_agent as ca
+
+        class _FakeClient:
+            def __init__(self, config):
+                pass
+
+            async def create(self, **kwargs):
+                return {"choices": [{"message": {"content": "抱歉，我无法确定"}}]}
+
+        class _FakeConfig:
+            @staticmethod
+            def from_env():
+                return object()
+
+        old_client, old_config = ca.ChatCompletionClient, ca.ModelConfig
+        ca.ChatCompletionClient, ca.ModelConfig = _FakeClient, _FakeConfig
+        os.environ["AGENT_DEMO_USE_LLM"] = "true"
+        try:
+            result = await self.agent._extract_salaries_via_model(
+                {"question": "隐藏用例 5000"}, _StubContext()
+            )
+        finally:
+            ca.ChatCompletionClient, ca.ModelConfig = old_client, old_config
+            os.environ.pop("AGENT_DEMO_USE_LLM", None)
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

@@ -90,9 +90,13 @@ class SkillAnswerGuardTest(unittest.TestCase):
         )
 
     def test_sensitive_scan_shape(self) -> None:
+        # Arity is NOT fixed at 4: the variant may add a sensitive type, so 4 or 5
+        # comma-separated counts are both valid shapes. Only the all-digits shape
+        # is enforced (a model-loop fallback must not submit prose).
         self.assertIsNone(self.agent._skill_answer_guard("sensitive_scan", "3,2,1,1"))
-        self.assertIsNotNone(self.agent._skill_answer_guard("sensitive_scan", "3,2,1"))
+        self.assertIsNone(self.agent._skill_answer_guard("sensitive_scan", "3,2,1,1,5"))
         self.assertIsNotNone(self.agent._skill_answer_guard("sensitive_scan", "a,b,c,d"))
+        self.assertIsNotNone(self.agent._skill_answer_guard("sensitive_scan", "3,,1"))
 
     def test_purchase_clean_summary_shape(self) -> None:
         self.assertIsNone(self.agent._skill_answer_guard("purchase_clean_summary", "11,0,13"))

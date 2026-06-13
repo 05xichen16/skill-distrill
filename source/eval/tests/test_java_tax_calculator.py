@@ -329,8 +329,6 @@ class AnswerFallbackChainTest(unittest.TestCase):
         self.module._call_model = fake_model
         self.module.java_version_line = lambda: 'openjdk version "21.0.11"'
 
-        import tempfile, os
-
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "TaxVariant.java")
             with open(path, "w", encoding="utf-8") as handle:
@@ -350,8 +348,6 @@ class AnswerFallbackChainTest(unittest.TestCase):
         self.module.java_toolchain_available = lambda: False
         self.module._model_config = lambda: None
         self.module.java_version_line = lambda: 'openjdk version "21.0.11"'
-
-        import tempfile, os
 
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "TaxVariant.java")
@@ -808,6 +804,123 @@ class VariableDepthEncodingTest(unittest.TestCase):
             any("could not convert string to float" in str(w) for w in result["warnings"]),
             result["warnings"],
         )
+
+
+class HiddenSalariesVariantTest(unittest.TestCase):
+    """The deterministic salary floor must survive variant input formatting
+    ('输入范围可能变化'): the old bare-4-digit-line regex silently fell back to
+    DEFAULT_SALARIES (== the public set) on any reformatting, computing the wrong
+    inputs -> every positional tax segment off."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    def test_comma_separated_after_anchor(self) -> None:
+        text = "测试用例（按顺序执行）：\n5000, 12000, 25000\n回复格式：略"
+        self.assertEqual(self.module.hidden_salaries(text), [5000, 12000, 25000])
+
+    def test_unit_suffix_lines(self) -> None:
+        text = "请计算以下月薪：\n6000元\n13000 元\n回复格式："
+        self.assertEqual(self.module.hidden_salaries(text), [6000, 13000])
+
+    def test_three_digit_salaries(self) -> None:
+        text = "隐藏用例：\n800\n999\n"
+        self.assertEqual(self.module.hidden_salaries(text), [800, 999])
+
+    def test_excludes_worked_examples_and_version_line(self) -> None:
+        text = (
+            "示例：\n3000 -> 0.00\n8000 -> 90.00\n"
+            "测试用例：按顺序执行\n5000\n12000\n"
+            '回复格式：\nopenjdk version "17.0.2",（输出1）,（输出2）'
+        )
+        self.assertEqual(self.module.hidden_salaries(text), [5000, 12000])
+
+    def test_no_anchor_falls_back_to_whole_text_scan(self) -> None:
+        self.assertEqual(self.module.hidden_salaries("随便\n5000\n12000\n"), [5000, 12000])
+
+    def test_empty_falls_back_to_defaults(self) -> None:
+        self.assertEqual(
+            self.module.hidden_salaries("no salaries here"), self.module.DEFAULT_SALARIES
+        )
+
+    def test_public_text_unchanged(self) -> None:
+        # Zero-regression guard for the public question wording.
+        self.assertEqual(
+            self.module.hidden_salaries(TASK_TEXT),
+            [5000, 12000, 25000, 35000, 55000, 60000, 80000, 90000, 150000, 500000],
+        )
+
+
+class VersionSegmentDoubleWinTest(unittest.TestCase):
+    """The version segment is graded with ``contain[<ver>]`` (substring), so emit
+    BOTH the pinned 21.0.11 AND the live-probed JDK — whichever the variant's
+    reference pins, the substring hits. Never contains a comma (would split the
+    answer)."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    def tearDown(self) -> None:
+        os.environ.pop("JAVA_TAX_VERSION_PROBE", None)
+
+    def test_probe_disabled_returns_pinned(self) -> None:
+        os.environ["JAVA_TAX_VERSION_PROBE"] = "0"
+        self.assertEqual(self.module.java_version_line(), 'openjdk version "21.0.11"')
+
+    def test_probe_failure_falls_back_to_pinned(self) -> None:
+        self.module._probe_java_version = lambda: None
+        self.assertEqual(self.module.java_version_line(), 'openjdk version "21.0.11"')
+
+    def test_probe_different_version_contains_both_no_comma(self) -> None:
+        self.module._probe_java_version = lambda: 'openjdk version "17.0.2"'
+        segment = self.module.java_version_line()
+        self.assertIn("21.0.11", segment)
+        self.assertIn("17.0.2", segment)
+        self.assertNotIn(",", segment)
+
+    def test_probe_already_pinned_not_duplicated(self) -> None:
+        self.module._probe_java_version = lambda: 'openjdk version "21.0.11"'
+        self.assertEqual(self.module.java_version_line(), 'openjdk version "21.0.11"')
+
+
+class ProvidedSalariesTest(unittest.TestCase):
+    """Router-supplied (model-extracted) salaries override the parsed ones, but a
+    malformed list is rejected so it cannot poison the positional tax segments."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    def test_valid_list(self) -> None:
+        self.assertEqual(
+            self.module._provided_salaries({"salaries": [5000, 12000]}), [5000, 12000]
+        )
+
+    def test_rejects_non_list(self) -> None:
+        self.assertIsNone(self.module._provided_salaries({"salaries": "5000"}))
+
+    def test_rejects_empty(self) -> None:
+        self.assertIsNone(self.module._provided_salaries({"salaries": []}))
+
+    def test_rejects_non_int_member(self) -> None:
+        self.assertIsNone(self.module._provided_salaries({"salaries": [5000, "x"]}))
+
+    def test_rejects_nonpositive(self) -> None:
+        self.assertIsNone(self.module._provided_salaries({"salaries": [5000, -1]}))
+
+    def test_answer_uses_provided_salaries(self) -> None:
+        self.module.java_version_line = lambda: 'openjdk version "21.0.11"'
+        result = self.module.answer(
+            {
+                "task_description": TASK_TEXT,
+                "source_file": str(PUBLIC_SOURCE),
+                "_runtime": {},
+                "salaries": [5000, 12000],
+            }
+        )
+        segments = result["answer"].split(",")
+        # version + exactly the two provided salaries' taxes (not the public 10).
+        self.assertEqual(len(segments), 3)
+        self.assertEqual(segments[1:], [_expected_tax(5000), _expected_tax(12000)])
 
 
 if __name__ == "__main__":

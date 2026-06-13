@@ -1,0 +1,1 @@
+{"file": ".trellis/tasks/archive/2026-06/06-12-optimize-platform-score/research/2_3-variant-findings.md", "reason": "2_3 变种根因事实基线：公开税表/起征点(5000)、match2 判分语义(contain[21.0.11]+is[税额])、worked-examples 与标准10薪资集、V1-V4 变种提取裁决(启发式+样例自校验各扛住情况)、精确0 vs 编排层判别。实现 salary 模型抽取+确定性兜底与版本段双赢时的对照依据。"}

@@ -75,14 +75,14 @@ class SensitiveScanConcurrencyTest(unittest.TestCase):
         in_flight = {"now": 0, "peak": 0}
         lock = threading.Lock()
 
-        def slow_extract(config, name, data, timeout):
+        def slow_extract(config, name, data, plan, timeout):
             with lock:
                 in_flight["now"] += 1
                 in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
             time.sleep(0.2)
             with lock:
                 in_flight["now"] -= 1
-            return {"phone": 1, "email": 0, "id": 0, "key": 0}
+            return [1, 0, 0, 0]  # phone,email,id,key (default plan order)
 
         self.module.extract_image_counts = slow_extract
         started = time.monotonic()
@@ -97,10 +97,10 @@ class SensitiveScanConcurrencyTest(unittest.TestCase):
         self.assertEqual(result["breakdown"]["image"][0], 4)
 
     def test_single_failure_degrades_not_kills(self) -> None:
-        def flaky_extract(config, name, data, timeout):
+        def flaky_extract(config, name, data, plan, timeout):
             if name.endswith("img_1.png"):
                 raise RuntimeError("gateway boom")
-            return {"phone": 0, "email": 0, "id": 1, "key": 0}
+            return [0, 0, 1, 0]  # one id
 
         self.module.extract_image_counts = flaky_extract
         result = self._scan(_archive_with_images(3), "fail.zip")
@@ -116,9 +116,9 @@ class SensitiveScanConcurrencyTest(unittest.TestCase):
         # within the runner's kill budget, the skill must still return a
         # well-formed text answer fast (a dropped stdout forces the version-less
         # model loop). Here OCR "hangs" but a near-past deadline cuts it off.
-        def hang_extract(config, name, data, timeout):
+        def hang_extract(config, name, data, plan, timeout):
             time.sleep(5.0)
-            return {"phone": 9, "email": 9, "id": 9, "key": 9}
+            return [9, 9, 9, 9]
 
         self.module.extract_image_counts = hang_extract
         self.module._ocr_deadline = lambda start: time.monotonic() + 0.3
@@ -140,12 +140,12 @@ class SensitiveScanConcurrencyTest(unittest.TestCase):
         attempts = {}
         lock = threading.Lock()
 
-        def flaky_then_ok(config, name, data, timeout):
+        def flaky_then_ok(config, name, data, plan, timeout):
             with lock:
                 attempts[name] = attempts.get(name, 0) + 1
                 if attempts[name] == 1:
                     raise RuntimeError("transient")
-            return {"phone": 0, "email": 0, "id": 0, "key": 1}
+            return [0, 0, 0, 1]  # one key
 
         self.module.extract_image_counts = flaky_then_ok
         result = self._scan(_archive_with_images(2), "retry.zip")
@@ -163,13 +163,13 @@ class SensitiveScanConcurrencyTest(unittest.TestCase):
         lock = threading.Lock()
         storm_len = 6  # > the old SENSITIVE_SCAN_RETRIES default of 3
 
-        def storm_then_ok(config, name, data, timeout):
+        def storm_then_ok(config, name, data, plan, timeout):
             with lock:
                 attempts[name] = attempts.get(name, 0) + 1
                 n = attempts[name]
             if name.endswith("img_1.png") and n <= storm_len:
                 raise RuntimeError("HTTP Error 500: ")
-            return {"phone": 0, "email": 0, "id": 1, "key": 0}
+            return [0, 0, 1, 0]  # one id
 
         self.module.extract_image_counts = storm_then_ok
         result = self._scan(_archive_with_images(3), "storm.zip")
@@ -188,14 +188,14 @@ class SensitiveScanConcurrencyTest(unittest.TestCase):
         in_flight = {"now": 0, "peak": 0}
         lock = threading.Lock()
 
-        def slow_ok(config, name, data, timeout):
+        def slow_ok(config, name, data, plan, timeout):
             with lock:
                 in_flight["now"] += 1
                 in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
             time.sleep(0.05)
             with lock:
                 in_flight["now"] -= 1
-            return {"phone": 1, "email": 0, "id": 0, "key": 0}
+            return [1, 0, 0, 0]  # one phone
 
         self.module.extract_image_counts = slow_ok
         result = self._scan(_archive_with_images(6), "cap.zip")
