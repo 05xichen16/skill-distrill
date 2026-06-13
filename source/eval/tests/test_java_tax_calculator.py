@@ -209,6 +209,78 @@ class VariableDepthEncodingTest(unittest.TestCase):
             self.module.decode_encoded_constant("not base64 and not a number !!", float)
 
 
+class OutputPrecisionTest(unittest.TestCase):
+    """Output decimal places are derived from the spec, not hardcoded to 2."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    def test_precision_from_examples(self) -> None:
+        f = self.module.output_precision
+        self.assertEqual(f([(3000, "0.00"), (8000, "90.00")], "", ""), 2)
+        self.assertEqual(f([(3000, "0.000"), (8000, "90.000")], "", ""), 3)
+        self.assertEqual(f([(3000, "0"), (8000, "90")], "", ""), 0)
+        # A bare-integer example mixed in must not drag precision below the rest.
+        self.assertEqual(f([(3000, "0"), (8000, "90.00")], "", ""), 2)
+
+    def test_examples_take_priority_over_comment(self) -> None:
+        self.assertEqual(self.module.output_precision([(3000, "0.000")], "保留2位小数", ""), 3)
+
+    def test_precision_from_comment_when_no_examples(self) -> None:
+        self.assertEqual(self.module.output_precision([], "结果保留3位小数", ""), 3)
+        self.assertEqual(self.module.output_precision([], "keep 4 decimal places", ""), 4)
+
+    def test_precision_default_two(self) -> None:
+        self.assertEqual(self.module.output_precision([], "", ""), 2)
+
+    def test_format_tax(self) -> None:
+        self.assertEqual(self.module._format_tax(1340.0, 2), "1340.00")
+        self.assertEqual(self.module._format_tax(1340.0, 0), "1340")
+        self.assertEqual(self.module._format_tax(1340.0, 3), "1340.000")
+        self.assertEqual(self.module._format_tax(1340.5, 2), "1340.50")
+
+
+class VariablePrecisionE2ETest(unittest.TestCase):
+    """A variant demanding 3-decimal output must format every segment to 3."""
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+        self.source = PUBLIC_SOURCE.read_text(encoding="utf-8")
+
+    def test_three_decimal_variant_end_to_end(self) -> None:
+        self.module._model_config = lambda: None
+        self.module.java_version_line = lambda: 'openjdk version "21.0.11"'
+        ded, brackets = self.module.decode_parameters(self.source)
+
+        ex_salaries = [3000, 8000, 15000, 30000]
+        ex_lines = "\n".join(
+            "%d -> %s"
+            % (s, self.module._format_tax(self.module.calculate_tax(s, ded, brackets), 3))
+            for s in ex_salaries
+        )
+        hidden = [5000, 12000, 25000, 35000]
+        task = "【示例输入输出】\n%s\n\n【隐藏用例】\n%s\n" % (
+            ex_lines,
+            "\n".join(str(s) for s in hidden),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "JavaSource_7_1.java")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(self.source)
+            result = self.module.answer(
+                {"task_description": task, "source_file": path, "_runtime": {}}
+            )
+
+        self.assertEqual(result["path"], "python")
+        segments = result["answer"].split(",")[1:]
+        self.assertTrue(all(len(s.split(".")[1]) == 3 for s in segments), segments)
+        self.assertEqual(
+            segments,
+            [self.module._format_tax(self.module.calculate_tax(s, ded, brackets), 3) for s in hidden],
+        )
+
+
 class GenericParameterExtractionTest(unittest.TestCase):
     def setUp(self) -> None:
         self.module = _load_module()
@@ -335,7 +407,7 @@ class JavaPathTest(unittest.TestCase):
         def fake_compile(source, work_dir):
             return compile_results.pop(0)
 
-        def fake_run(class_name, work_dir, salary):
+        def fake_run(class_name, work_dir, salary, precision=2):
             return _expected_tax(salary)
 
         self.module._call_model = fake_model
@@ -363,7 +435,7 @@ class JavaPathTest(unittest.TestCase):
         self.module._call_model = fake_model
         self.module.compile_java = lambda source, work_dir: ("TaxCalc", "")
 
-        def fake_run(class_name, work_dir, salary):
+        def fake_run(class_name, work_dir, salary, precision=2):
             if len(repair_calls) == 1:
                 return "1.00"  # wrong on every example in round 1
             return _expected_tax(salary)
@@ -467,7 +539,7 @@ class JavaTaxPathOrderingTest(unittest.TestCase):
         # every case runs to the reference tax.
         self.module._call_model = lambda config, prompt, timeout: "public class C {}"
         self.module.compile_java = lambda source, work_dir: ("C", "")
-        self.module.run_java_case = lambda cls, work_dir, salary: _expected_tax(salary)
+        self.module.run_java_case = lambda cls, work_dir, salary, precision=2: _expected_tax(salary)
 
     def _answer_for(self, source: str) -> dict:
         with tempfile.TemporaryDirectory() as tmp:
