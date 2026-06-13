@@ -57,6 +57,7 @@ import io
 import json
 import lzma
 import os
+import random
 import re
 import sys
 import tarfile
@@ -614,75 +615,110 @@ def _ocr_images(
     deadline: float,
     warnings: List[str],
 ) -> Tuple[Dict[str, int], int, List[str]]:
-    """OCR every image concurrently, bounded by a wall-clock deadline.
+    """OCR every image, RE-ATTEMPTING failures in rounds until the deadline.
 
-    One failed/slow image degrades to a warning, never kills the scan. When the
-    deadline is reached, pending images are abandoned with a warning so the
-    caller can still emit text + completed-image counts before the runner's kill
-    timeout fires.
+    This question is graded positionally and exactly ("ratio"): a single image
+    whose tokens never reach the count makes 1-4 fields off-by-a-few, and every
+    off field scores zero -- so a graceful "skip the broken image" degrades the
+    score exactly as hard as a crash. The ONLY thing that earns points is that
+    EVERY image is transcribed at least once before the deadline.
+
+    The platform grades ~10 questions at once, so the shared model gateway
+    returns transient 5xx / RemoteDisconnected storms (the observed failure was a
+    bare ``HTTP Error 500`` on one image). Those clear on their own within tens
+    of seconds, and the skill budget (~570s for <=8 images) is enormous next to a
+    single transcription (~60s). So instead of a few quick retries we retry every
+    still-failing image in successive ROUNDS, with exponential backoff + FULL
+    JITTER, until it succeeds or the budget runs out. Key properties:
+
+      * Concurrency is capped at ``workers`` -> peak gateway load is bounded (we
+        do not amplify the storm we are trying to ride out).
+      * Rounds -- not a worker spinning forever on one image -- provide the
+        retries, so a permanently-failing image can never starve the others.
+      * Jitter desynchronises our retries from the other concurrently-graded
+        questions so they stop re-hammering the gateway in lockstep.
+      * A round's hung/slow calls are abandoned the instant the deadline passes,
+        so a well-formed answer is always emitted before the runner's kill.
     """
     image_counts = _empty_counts()
     images_ocr_ok = 0
     timeout = _ocr_timeout()
-    # Under the generous (600s) skill budget we can afford a few retries; a
-    # gateway storm (the platform runs CONCURRENCY questions at once) returns
-    # 5xx / RemoteDisconnected, and an EXPONENTIAL BACKOFF between attempts lets
-    # it recover instead of immediately re-hammering it.
-    retries = _env_int("SENSITIVE_SCAN_RETRIES", 3, minimum=1)
+    # Backstop attempt cap (only the limiter for unbounded/unit-test deadlines;
+    # on the platform the wall-clock deadline stops us first, ~tens of rounds).
+    max_attempts = _env_int("SENSITIVE_SCAN_RETRIES", 200, minimum=1)
     workers = _env_int("SENSITIVE_SCAN_WORKERS", 4, minimum=1)
     backoff = _env_float("SENSITIVE_SCAN_RETRY_BACKOFF", 1.0, minimum=0.0)
+    backoff_cap = _env_float("SENSITIVE_SCAN_RETRY_BACKOFF_CAP", 20.0, minimum=0.0)
 
-    def ocr_one(item: Tuple[str, bytes]) -> Tuple[Dict[str, int], Optional[str]]:
+    def single_attempt(item: Tuple[str, bytes]) -> Tuple[Dict[str, int], Optional[str]]:
         name, data = item
-        last_exc: Optional[Exception] = None
-        for attempt in range(retries):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return _empty_counts(), "deadline reached before OCR of %s" % name
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return _empty_counts(), "deadline reached before OCR of %s" % name
+        call_timeout = max(5, min(timeout, int(remaining)))
+        try:
+            return extract_image_counts(config, name, data, call_timeout), None
+        except Exception as exc:  # noqa: BLE001 - graceful degradation
+            return _empty_counts(), "image extraction failed for %s: %s" % (name, exc)
+
+    pending: List[Tuple[str, bytes]] = list(images)
+    last_error: Dict[str, str] = {}
+    pool = ThreadPoolExecutor(max_workers=max(1, min(workers, len(pending))))
+    try:
+        attempt = 0
+        while pending and attempt < max_attempts and time.monotonic() < deadline:
             if attempt > 0 and backoff > 0:
-                # Sleep before the retry, but never past the deadline.
-                sleep_for = min(backoff * (2 ** (attempt - 1)), max(0.0, remaining - 1.0))
+                # Exponential backoff with FULL JITTER, never sleeping past the
+                # deadline. Full jitter (uniform in [0, base]) spreads retries so
+                # the failing images -- and the other graded questions -- do not
+                # re-hit the gateway in a synchronised burst.
+                base = min(backoff * (2 ** min(attempt - 1, 16)), backoff_cap)
+                remaining = deadline - time.monotonic()
+                sleep_for = min(base * random.random(), max(0.0, remaining - 1.0))
                 if sleep_for > 0:
                     time.sleep(sleep_for)
-            call_timeout = max(5, min(timeout, int(deadline - time.monotonic())))
+                if time.monotonic() >= deadline:
+                    break
+
+            round_results: Dict[str, Tuple[Dict[str, int], Optional[str]]] = {}
+            futures = {pool.submit(single_attempt, item): item for item in pending}
             try:
-                return extract_image_counts(config, name, data, call_timeout), None
-            except Exception as exc:  # noqa: BLE001 - graceful degradation
-                last_exc = exc
-        return _empty_counts(), "image extraction failed for %s: %s" % (name, last_exc)
+                wait_for = max(0.0, min(deadline - time.monotonic(), _UNBOUNDED_WAIT))
+                for future in as_completed(futures, timeout=wait_for):
+                    item = futures[future]
+                    round_results[item[0]] = future.result()
+            except FuturesTimeoutError:
+                # Deadline hit mid-round: unfinished calls are abandoned. The
+                # while-condition below exits the loop; their futures keep running
+                # in the (wait=False) pool and never delay the answer emit.
+                pass
 
-    total = len(images)
-    if workers <= 1 or total == 1:
-        for item in images:
-            if time.monotonic() >= deadline:
-                warnings.append("deadline reached; skipped image %s" % item[0])
-                continue
-            counts, warning = ocr_one(item)
-            if warning:
-                warnings.append(warning)
-            else:
-                _add(image_counts, counts)
-                images_ocr_ok += 1
-        return image_counts, images_ocr_ok, warnings
-
-    pool = ThreadPoolExecutor(max_workers=min(workers, total))
-    futures = {pool.submit(ocr_one, item): item for item in images}
-    try:
-        wait_for = max(0.0, min(deadline - time.monotonic(), _UNBOUNDED_WAIT))
-        for future in as_completed(futures, timeout=wait_for):
-            counts, warning = future.result()
-            if warning:
-                warnings.append(warning)
-            else:
-                _add(image_counts, counts)
-                images_ocr_ok += 1
-    except FuturesTimeoutError:
-        for future, item in futures.items():
-            if not future.done():
-                warnings.append("deadline reached; skipped image %s" % item[0])
+            next_pending: List[Tuple[str, bytes]] = []
+            for item in pending:
+                name = item[0]
+                result = round_results.get(name)
+                if result is None:
+                    # Did not finish this round (deadline cut / still running).
+                    if name not in last_error:
+                        last_error[name] = "deadline reached during OCR of %s" % name
+                    next_pending.append(item)
+                    continue
+                counts, error = result
+                if error:
+                    last_error[name] = error
+                    next_pending.append(item)
+                else:
+                    _add(image_counts, counts)
+                    images_ocr_ok += 1
+            pending = next_pending
+            attempt += 1
     finally:
         # Do not block on still-running calls: main() hard-exits after emitting.
         pool.shutdown(wait=False)
+
+    for item in pending:
+        name = item[0]
+        warnings.append(last_error.get(name, "image extraction failed for %s: retries exhausted" % name))
     return image_counts, images_ocr_ok, warnings
 
 

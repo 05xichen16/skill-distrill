@@ -335,6 +335,97 @@ class ContestantAgentRouterTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("21.0.11", segments[0])
         self.assertEqual(segments[1:], self._PUBLIC_HIDDEN_TAXES)
 
+    # --- purchase_clean_summary (2_1) in-process floor ----------------------
+    # The skill's 900s subprocess can be killed / lose stdout under concurrent
+    # gateway load (the sibling interface_test line in the platform log timed out
+    # at 600s the same way), or the shared run-cap can fire mid-OCR. That used to
+    # drop 2_1 to the version-less model loop — an exact zero on this
+    # query-ordered positional grader. solve() must instead emit the
+    # deterministic NO-OCR baseline in-process: 10/12 on the public set, instant,
+    # and impossible to kill mid-call.
+
+    @property
+    def _public_purchase_dir(self) -> Path:
+        return (
+            Path(__file__).resolve().parents[3]
+            / "publish" / "publish_V1" / "采购数据清洗与汇总"
+        )
+
+    def _purchase_no_ocr_baseline(self) -> str:
+        """The deterministic answer solve()'s floor must reproduce (do_ocr off,
+        no LLM rescue — config is None offline). Computed live so the assertion
+        tracks the algorithm instead of a brittle hard-coded string."""
+        from source.solution.skills.purchase_clean_summary.scripts import run as R
+
+        rules = R.read_text(str(self._public_purchase_dir / "data_rules.md"))
+        out = R.answer(
+            {
+                "source_dir": str(self._public_purchase_dir),
+                "task_description": rules,
+                "do_ocr": False,
+            }
+        )
+        return out["answer"]
+
+    async def test_purchase_floor_answers_when_subprocess_dies(self) -> None:
+        """The observed risk: the purchase skill subprocess is killed (timeout /
+        dropped stdout). The full-OCR skill path still gets first crack, but when
+        it dies the in-process no-OCR floor answers instead of the model loop."""
+        if not self._public_purchase_dir.is_dir():
+            self.skipTest("public dataset not present")
+        # Model loop disabled, so a correct answer PROVES it came from the
+        # deterministic in-process floor, not the model.
+        os.environ["AGENT_DEMO_USE_LLM"] = "false"
+        expected = self._purchase_no_ocr_baseline()
+
+        class _DyingContext(_StubContext):
+            async def call_tool(self, name, args):
+                self.calls.append((name, args))
+                raise RuntimeError("skill subprocess killed (timeout 900s)")
+
+        context = _DyingContext(allowed_file_paths=[str(self._public_purchase_dir)])
+        answer = await self.agent.solve(
+            question={
+                "title": "采购数据清洗与汇总",
+                "question": "clean purchase data",
+                "files": [str(self._public_purchase_dir)],
+            },
+            context=context,
+        )
+        # The skill WAS attempted first (full-OCR path); only after it died did
+        # the floor take over.
+        self.assertEqual(context.calls[0][0], "skill_run")
+        self.assertEqual(context.calls[0][1]["name"], "purchase_clean_summary")
+        self.assertEqual(answer, expected)
+        segments = answer.split(",")
+        self.assertTrue(segments and all(s.lstrip("-").isdigit() for s in segments))
+        # A real computation, not the right-length all-zero emergency floor.
+        self.assertTrue(any(s not in ("0", "-0") for s in segments))
+
+    async def test_purchase_floor_answers_when_skill_not_discovered(self) -> None:
+        """The skill-absent exact-zero mode: purchase_clean_summary is not in
+        available_skills, so the explicit route never fires. The content-gated
+        floor must still answer instead of surrendering to the model loop."""
+        if not self._public_purchase_dir.is_dir():
+            self.skipTest("public dataset not present")
+        os.environ["AGENT_DEMO_USE_LLM"] = "false"
+        expected = self._purchase_no_ocr_baseline()
+        # available_skills deliberately omits purchase_clean_summary.
+        context = _StubContext(
+            skills=["spec_qa", "sensitive_scan"],
+            allowed_file_paths=[str(self._public_purchase_dir)],
+        )
+        answer = await self.agent.solve(
+            question={
+                "title": "采购数据清洗与汇总",
+                "question": "clean purchase data",
+                "files": [str(self._public_purchase_dir)],
+            },
+            context=context,
+        )
+        self.assertEqual(context.calls, [])  # no purchase route possible, none attempted
+        self.assertEqual(answer, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

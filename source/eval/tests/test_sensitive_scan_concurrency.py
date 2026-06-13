@@ -154,6 +154,56 @@ class SensitiveScanConcurrencyTest(unittest.TestCase):
         self.assertEqual(result["breakdown"]["image"][3], 2)
         self.assertEqual(result["warnings"], [])
 
+    def test_storm_recovery_rides_out_prolonged_5xx(self) -> None:
+        # The real platform failure: one image keeps returning HTTP 500 during a
+        # gateway storm that outlasts the OLD 3-retry budget, then recovers. With
+        # "ratio" grading a dropped image zeroes 1-4 fields, so we MUST keep
+        # retrying (in rounds) until the storm clears, not give up after 3.
+        attempts = {}
+        lock = threading.Lock()
+        storm_len = 6  # > the old SENSITIVE_SCAN_RETRIES default of 3
+
+        def storm_then_ok(config, name, data, timeout):
+            with lock:
+                attempts[name] = attempts.get(name, 0) + 1
+                n = attempts[name]
+            if name.endswith("img_1.png") and n <= storm_len:
+                raise RuntimeError("HTTP Error 500: ")
+            return {"phone": 0, "email": 0, "id": 1, "key": 0}
+
+        self.module.extract_image_counts = storm_then_ok
+        result = self._scan(_archive_with_images(3), "storm.zip")
+
+        # Every image is eventually transcribed -> all fields correct, no warning.
+        self.assertEqual(result["images_ocr_ok"], 3)
+        self.assertEqual(result["breakdown"]["image"][2], 3)  # id from all 3
+        self.assertEqual(result["warnings"], [])
+        self.assertGreater(attempts["img_1.png"], storm_len)
+
+    def test_concurrency_is_capped_at_workers(self) -> None:
+        # We must NOT amplify the storm: peak in-flight OCR calls stay <= workers
+        # even when there are many more images than workers.
+        os.environ["SENSITIVE_SCAN_WORKERS"] = "2"
+        self.addCleanup(os.environ.pop, "SENSITIVE_SCAN_WORKERS", None)
+        in_flight = {"now": 0, "peak": 0}
+        lock = threading.Lock()
+
+        def slow_ok(config, name, data, timeout):
+            with lock:
+                in_flight["now"] += 1
+                in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+            time.sleep(0.05)
+            with lock:
+                in_flight["now"] -= 1
+            return {"phone": 1, "email": 0, "id": 0, "key": 0}
+
+        self.module.extract_image_counts = slow_ok
+        result = self._scan(_archive_with_images(6), "cap.zip")
+
+        self.assertEqual(result["images_ocr_ok"], 6)
+        self.assertEqual(result["breakdown"]["image"][0], 6)
+        self.assertLessEqual(in_flight["peak"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
