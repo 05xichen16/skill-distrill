@@ -133,6 +133,28 @@ class SkillAnswerGuardTest(unittest.TestCase):
             self.agent._skill_answer_guard("prompt_learn_classify", "PASS,FAIL")
         )
 
+    # --- interface_test ----------------------------------------------------
+    def test_interface_test_id_list_accepted(self) -> None:
+        self.assertIsNone(self.agent._skill_answer_guard("interface_test", "TC009,TC011,TC014"))
+        self.assertIsNone(self.agent._skill_answer_guard("interface_test", "TC009"))
+
+    def test_interface_test_prose_rejected(self) -> None:
+        # The question demands ONLY the comma-joined ids; prose / enumeration
+        # commas are non-conforming (the platform "格式不对应" failure).
+        self.assertIsNotNone(
+            self.agent._skill_answer_guard("interface_test", "失败用例为 TC009、TC011")
+        )
+
+    def test_interface_test_multiline_rejected(self) -> None:
+        self.assertIsNotNone(
+            self.agent._skill_answer_guard("interface_test", "经分析：\nTC009,TC011")
+        )
+
+    def test_interface_test_wrong_but_wellformed_passes(self) -> None:
+        # The positional ratio grader judges content; a wrong-but-shaped id list
+        # must still pass the shape guard.
+        self.assertIsNone(self.agent._skill_answer_guard("interface_test", "TC001,TC002"))
+
     # --- wrong-but-well-formed answers MUST pass (never reject content) ----
     def test_guards_never_reject_wrong_content(self) -> None:
         self.assertIsNone(self.agent._skill_answer_guard("sensitive_scan", "0,0,0,0"))
@@ -344,6 +366,54 @@ class TruncationRetryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(answer, "PO-2026-0003")
         # the second request carries the truncation instruction
         self.assertTrue(any("输出被截断" in content for content in seen_messages[1]))
+
+
+class InterfaceTestNormalizeTest(unittest.TestCase):
+    """A model-loop replacement for interface_test must be salvaged to the
+    required "comma-joined failing ids only" shape before it is submitted."""
+
+    def setUp(self) -> None:
+        self.agent = ContestantAgent()
+
+    def test_clean_list_unchanged(self) -> None:
+        self.assertEqual(
+            self.agent._normalize_interface_test_answer("TC009,TC011,TC014"),
+            "TC009,TC011,TC014",
+        )
+
+    def test_clean_list_trims_and_drops_empty(self) -> None:
+        self.assertEqual(
+            self.agent._normalize_interface_test_answer(" TC009 , TC011 ,"),
+            "TC009,TC011",
+        )
+
+    def test_enumeration_comma_salvaged(self) -> None:
+        self.assertEqual(
+            self.agent._normalize_interface_test_answer("TC009、TC011、TC014"),
+            "TC009,TC011,TC014",
+        )
+
+    def test_prose_salvaged_to_ids(self) -> None:
+        self.assertEqual(
+            self.agent._normalize_interface_test_answer("失败的用例有 TC009, TC011 和 TC014。"),
+            "TC009,TC011,TC014",
+        )
+
+    def test_incidental_user_id_dropped_by_dominant_prefix(self) -> None:
+        # A user id mentioned in prose (U1010) must not be taken for a failing
+        # case id; the dominant TC family wins and order is preserved.
+        self.assertEqual(
+            self.agent._normalize_interface_test_answer(
+                "TC009 因为 U1010 的经理不符；TC011、TC014 也失败"
+            ),
+            "TC009,TC011,TC014",
+        )
+
+    def test_no_ids_is_empty(self) -> None:
+        self.assertEqual(
+            self.agent._normalize_interface_test_answer("所有用例均通过，无失败。"), ""
+        )
+        self.assertEqual(self.agent._normalize_interface_test_answer("   "), "")
 
 
 if __name__ == "__main__":

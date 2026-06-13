@@ -698,5 +698,117 @@ class EmergencyExitPathTest(unittest.TestCase):
         self.assertEqual(result["path"], "emergency")
 
 
+class VariableDepthEncodingTest(unittest.TestCase):
+    """Hidden 2_3 variants change the base64 *encoding depth* of the named
+    constants. The platform wrapped the deduction point in FOUR base64 layers,
+    so a fixed triple-decode left it as 'NDAwMA==', float() crashed the whole
+    authoritative ``decode_parameters`` into the fragile heuristic, and the
+    answer scored an exact zero (platform diag: ``base64 parameter decode
+    unavailable: could not convert string to float: 'NDAwMA=='``). decoding must
+    peel depth-agnostically so 3-, 4- or N-layer encodings all resolve."""
+
+    # A self-consistent variant schedule with the platform's 4000 deduction
+    # (worked examples below are computed from these, so they always validate).
+    VARIANT_BRACKETS = [
+        [0.0, 3000.0, 0.03, 0.0],
+        [3001.0, 12000.0, 0.1, 210.0],
+        [12001.0, 25000.0, 0.2, 1410.0],
+        [25001.0, 35000.0, 0.25, 2660.0],
+        [35001.0, 55000.0, 0.3, 4410.0],
+        [55001.0, 80000.0, 0.35, 7160.0],
+        [80001.0, 999999999.0, 0.45, 15160.0],
+    ]
+    VARIANT_DEDUCTION = 4000.0
+    EXAMPLE_SALARIES = [3000, 9000, 20000, 40000, 120000]
+    HIDDEN_SALARIES = [5000, 12000, 25000, 35000, 55000, 60000, 80000, 90000, 150000, 500000]
+
+    def setUp(self) -> None:
+        self.module = _load_module()
+
+    def _tax(self, salary: float) -> str:
+        return "%.2f" % self.module.calculate_tax(
+            salary, self.VARIANT_DEDUCTION, self.VARIANT_BRACKETS
+        )
+
+    def _task_text(self) -> str:
+        examples = "\n".join("%d -> %s" % (s, self._tax(s)) for s in self.EXAMPLE_SALARIES)
+        hidden = "\n".join(str(s) for s in self.HIDDEN_SALARIES)
+        return "【示例输入输出】\n%s\n\n【隐藏用例】\n%s\n" % (examples, hidden)
+
+    @staticmethod
+    def _encode_layers(text: str, layers: int) -> str:
+        raw = text.encode("utf-8")
+        for _ in range(layers):
+            raw = base64.b64encode(raw)
+        return raw.decode("ascii")
+
+    def _variant_source(self, layers: int) -> str:
+        return (
+            "public class JavaSource_7_1 {\n"
+            '  private static final String TAX_BRACKETS_ENCODED = "%s";\n'
+            '  private static final String DEDUCTION_POINT_ENCODED = "%s";\n'
+            "}\n"
+        ) % (
+            self._encode_layers(json.dumps(self.VARIANT_BRACKETS), layers),
+            self._encode_layers(str(int(self.VARIANT_DEDUCTION)), layers),
+        )
+
+    def test_four_layer_constants_decode_to_exact_values(self) -> None:
+        deduction, brackets = self.module.decode_parameters(self._variant_source(4))
+        self.assertEqual(deduction, self.VARIANT_DEDUCTION)
+        self.assertEqual(brackets, self.VARIANT_BRACKETS)
+
+    def test_depths_one_through_six_all_decode(self) -> None:
+        for layers in (1, 2, 3, 4, 5, 6):
+            with self.subTest(layers=layers):
+                deduction, brackets = self.module.decode_parameters(
+                    self._variant_source(layers)
+                )
+                self.assertEqual(deduction, self.VARIANT_DEDUCTION)
+                self.assertEqual(brackets, self.VARIANT_BRACKETS)
+
+    def test_full_answer_uses_decoded_4000_deduction(self) -> None:
+        task_text = self._task_text()
+        self.module._model_config = lambda: None
+        self.module.java_version_line = lambda: 'openjdk version "21.0.11"'
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "JavaSource_7_1.java")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(self._variant_source(4))
+            result = self.module.answer(
+                {"task_description": task_text, "source_file": path, "_runtime": {}}
+            )
+        segments = result["answer"].split(",")
+        self.assertEqual(len(segments), 11)
+        self.assertIn("21.0.11", segments[0])
+        self.assertEqual(result["path"], "python")
+        self.assertEqual(segments[1:], [self._tax(s) for s in self.HIDDEN_SALARIES])
+        # salary 5000 with the real deduction 4000 -> taxable 1000 -> NONZERO,
+        # exactly the segment the heuristic's wrong >=5000 deduction zeroed
+        # (the platform's tax_segs=10 nonzero=9 symptom).
+        self.assertNotEqual(segments[1], "0.00")
+
+    def test_emergency_path_recovers_taxes_on_four_layer_variant(self) -> None:
+        # The router's in-process fallback calls emergency_answer(config=None) —
+        # the exact path the platform diag came from. It must now reproduce the
+        # real taxes instead of crashing the decode into the wrong shape.
+        task_text = self._task_text()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "JavaSource_7_1.java")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(self._variant_source(4))
+            result = self.module.emergency_answer(
+                {"task_description": task_text, "source_file": path, "_runtime": {}},
+                "router in-process fallback",
+            )
+        segments = result["answer"].split(",")
+        self.assertEqual(result["emergency_detail"], "validated")
+        self.assertEqual(segments[1:], [self._tax(s) for s in self.HIDDEN_SALARIES])
+        self.assertFalse(
+            any("could not convert string to float" in str(w) for w in result["warnings"]),
+            result["warnings"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

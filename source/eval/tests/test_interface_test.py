@@ -946,6 +946,38 @@ class EndToEndTest(unittest.TestCase):
                 MOD.answer(args, parser=_fake_parser(STEPS_BY_ID), requester=boom)
         self.assertIn("degraded output", str(ctx.exception))
 
+    def test_confident_failures_returned_not_discarded_under_high_unjudged(self) -> None:
+        # FIX 1: when unjudgeable cases dominate BUT there is at least one
+        # confident failure, the conservative answer is a correct PREFIX and must
+        # be RETURNED (the position-sensitive ratio grader always rewards a
+        # correct prefix) rather than raised away to gamble on the unguarded
+        # model loop. This is the platform 1.49/6 root cause: under a throttled,
+        # shared gateway many cases abstain here, tripping the old raise that
+        # discarded the good prefix.
+        with tempfile.TemporaryDirectory() as tmp:
+            # C2 fails via pure-code inference (wrong value); C5 ("write") always
+            # abstains to the model seam, which we make raise -> unjudgeable.
+            doc_dir = _write_inputs(Path(tmp), [CASES[1], CASES[4]])
+            _set_fake_config()
+            os.environ["INTERFACE_TEST_RETRIES"] = "1"
+            svc = FakeService()
+            steps = dict(STEPS_BY_ID)
+            steps["case C5"] = RuntimeError("model down")
+            args = {
+                "task_description": "verify",
+                "doc_dir": str(doc_dir),
+                "_runtime": {"question_dir": str(doc_dir.parent)},
+            }
+            try:
+                result = MOD.answer(args, parser=_fake_parser(steps), requester=svc)
+            finally:
+                os.environ.pop("INTERFACE_TEST_RETRIES", None)
+        # unjudged dominates (1 of 2 -> 1*3 > 2) but C2 is a confident failure:
+        # the prefix is returned, NOT raised away.
+        self.assertEqual(result["answer"], "C2")
+        self.assertEqual(result["failed"], ["C2"])
+        self.assertEqual(result["unjudged"], 1)
+
     def test_package_id_header_on_every_call(self) -> None:
         # The same X-Package-Id must ride every request for the whole run.
         with tempfile.TemporaryDirectory() as tmp:

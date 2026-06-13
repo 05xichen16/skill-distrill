@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "FIX 1/2 都在错误/降级路径上：skill 抛异常、router 回退、守卫拒绝；须遵循既有错误处理与降级约定。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "改 run.py + contestant_agent.py 的质量基线（不破坏既有路径、保持纯标准库）。"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "新守卫/打捞须复用既有 _guard_* / _EMPTY_ANSWER_OK / score_ratio 形态，勿另起炉灶。"}
+{"file": ".trellis/tasks/archive/2026-06/06-12-optimize-platform-score/research/1_4-variant-findings.md", "reason": "1_4 变种真因研究：score_ratio 早位多报=归零、缺尾=温和；conservative-pass 非元凶；本次诊断的依据。"}

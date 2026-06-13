@@ -2184,13 +2184,21 @@ def answer(
         if reason and not passed:
             warnings.append("%s FAILED: %s" % (case_id, reason))
 
-    # When unjudgeable cases dominate, the silent all-pass answer is a known
-    # platform failure mode (1.07/6): raise so the router falls back to the
-    # model loop instead of submitting it. A model config that was never there
-    # is the local/offline situation — keep the legacy conservative answer.
-    if cases and config is not None and unjudged * 3 > len(cases):
+    # Escape an all-pass answer when unjudgeable cases dominate: a silent
+    # all-pass is a known platform failure mode (1.07/6), so raise and let the
+    # router fall back to the model loop instead of submitting it. But ONLY when
+    # there are NO confident failures to show: once ``failed`` is non-empty the
+    # conservative answer is a correct PREFIX, and the position-sensitive ratio
+    # grader rewards a correct prefix (it can never be zeroed by a later miss).
+    # Returning that prefix is strictly safer than discarding it to gamble on
+    # the model loop, which under platform concurrency (shared, throttled
+    # gateway -> many cases abstain here) is exactly what dropped 1_4 below its
+    # conservative floor. A model config that was never there is the local /
+    # offline situation, which already keeps the legacy conservative answer.
+    if cases and config is not None and not failed and unjudged * 3 > len(cases):
         raise RuntimeError(
-            "degraded output: %d/%d cases unjudgeable (parse/service failures); %s"
+            "degraded output (no confident failures): %d/%d cases unjudgeable "
+            "(parse/service failures); %s"
             % (unjudged, len(cases), _ascii_safe("; ".join(warnings[-3:])))
         )
 

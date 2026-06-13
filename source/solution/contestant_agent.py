@@ -154,6 +154,12 @@ class ContestantAgent:
         if routed_skill is None:
             self._diag(f"return via=model_loop {self._answer_preview(answer)}")
             return answer
+        # interface_test demands ONLY the comma-joined failing ids; a model-loop
+        # replacement may wrap them in prose or Chinese enumeration commas, so
+        # salvage to the required shape BEFORE the guard — otherwise a
+        # non-conforming answer is submitted (the platform "格式不对应" failure).
+        if routed_skill == "interface_test":
+            answer = self._normalize_interface_test_answer(answer)
         # The model loop replaced a known skill: its output must satisfy the
         # same shape guard, otherwise bare CoT/truncation garbage gets submitted.
         guarded = await self._guarded_model_answer(
@@ -532,6 +538,57 @@ class ContestantAgent:
         if not all(segment and re.fullmatch(r"[A-Za-z0-9_-]+", segment) for segment in segments):
             return "segments are not all PO-id shaped"
         return None
+
+    def _guard_interface_test(self, text: str) -> str | None:
+        # Shape: a single comma-separated line of FAILING test-case ids (e.g.
+        # "TC009,TC011"); the legal empty answer ("nothing failed") is handled
+        # by _EMPTY_ANSWER_OK before this guard runs. The question demands ONLY
+        # the comma-joined ids with no explanation, so reject bare CoT / prose /
+        # multi-line text: a model-loop fallback that replaced a crashed skill
+        # must not submit a non-conforming answer (the platform "格式不对应"
+        # failure). A wrong-but-well-formed id list still passes (the positional
+        # ratio grader judges content; shape is the only thing this guard owns).
+        if "\n" in text or "\r" in text:
+            return "answer is not a single line"
+        if len(text) >= 2000:
+            return "answer is too long for a failing-id list"
+        segments = [segment.strip() for segment in text.split(",")]
+        if not all(segment and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", segment) for segment in segments):
+            return "segments are not all test-case-id shaped"
+        return None
+
+    def _normalize_interface_test_answer(self, text: str) -> str:
+        """Salvage a comma-joined failing-id list from arbitrary model output.
+
+        The interface_test question demands ONLY the failing case ids joined by
+        commas. The skill's own answer is already in that shape (returned
+        verbatim here). A model-loop fallback, however, may wrap the ids in
+        prose or separate them with Chinese enumeration commas / spaces. We
+        extract the id-shaped tokens in order and re-join with ',' so the final
+        answer always conforms to the required format. Only the dominant id
+        prefix family (e.g. "TC") is kept, so an incidental user id mentioned in
+        prose (e.g. "U1010") is not mistaken for a failing-case id. Returns ""
+        when no id token is present (the legal empty answer: nothing failed)."""
+        stripped = (text or "").strip()
+        if not stripped:
+            return ""
+        # An already-clean comma list is returned unchanged (no behaviour change
+        # for the skill's own well-formed answer).
+        segments = [segment.strip() for segment in stripped.split(",")]
+        non_empty = [segment for segment in segments if segment]
+        if non_empty and all(
+            re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", segment) for segment in non_empty
+        ):
+            return ",".join(non_empty)
+        tokens = re.findall(r"[A-Za-z]{1,8}\d{1,8}", stripped)
+        if not tokens:
+            return ""
+        prefix_counts: dict[str, int] = {}
+        for token in tokens:
+            prefix = re.match(r"[A-Za-z]+", token).group(0)
+            prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+        dominant = max(prefix_counts, key=lambda key: (prefix_counts[key], key))
+        return ",".join(token for token in tokens if token.startswith(dominant))
 
     def _guard_system_issue_locator(self, text: str) -> str | None:
         if text.count(",") < 2:

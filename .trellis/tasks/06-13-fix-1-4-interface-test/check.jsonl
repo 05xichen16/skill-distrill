@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "验收质量门禁。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "核对降级/回退路径符合错误处理约定，never-raise 语义保持。"}
+{"file": ".trellis/tasks/archive/2026-06/06-12-optimize-platform-score/research/1_4-variant-findings.md", "reason": "复核修复后变种得分不回归（4–6/6）。"}
