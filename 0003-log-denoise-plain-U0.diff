@@ -1,0 +1,81 @@
+diff --git a/service/src/business/intent_recognition/intent_recognition_service.cpp b/service/src/business/intent_recognition/intent_recognition_service.cpp
+index c6c16b0..9053452 100644
+--- a/service/src/business/intent_recognition/intent_recognition_service.cpp
++++ b/service/src/business/intent_recognition/intent_recognition_service.cpp
+@@ -24 +24 @@ void IntentRecognitionService::AddIntentClarificationResult(const std::string& r
+-    LOG_INFO("[IntentRecognition] Add intent clarification result, responseId: %s", responseId.c_str());
++    LOG_DEBUG("[IntentRecognition] Add intent clarification result, responseId: %s", responseId.c_str());
+@@ -44 +44 @@ void IntentRecognitionService::RecognizeIntent(const std::string& userId,
+-    LOG_INFO("[IntentRecognition] Start intent recognition, responseId: %s", responseId.c_str());
++    LOG_DEBUG("[IntentRecognition] Start intent recognition, responseId: %s", responseId.c_str());
+@@ -52 +52 @@ void IntentRecognitionService::RecognizeIntent(const std::string& userId,
+-        LOG_INFO("[IntentRecognition] No delete memory keyword found, skip.");
++        LOG_DEBUG("[IntentRecognition] No delete memory keyword found, skip.");
+@@ -139 +139 @@ void IntentRecognitionService::UpdateIntentClarificationResult(const std::string
+-    LOG_INFO("[IntentRecognition] UpdateIntentClarificationResult, responseId: %s, intentResult: %s",
++    LOG_DEBUG("[IntentRecognition] UpdateIntentClarificationResult, responseId: %s, intentResult: %s",
+@@ -151 +151 @@ void IntentRecognitionService::UpdateIntentClarificationResult(const std::string
+-        LOG_INFO("[IntentRecognition] IntentClarificationResult updated successfully.");
++        LOG_DEBUG("[IntentRecognition] IntentClarificationResult updated successfully.");
+@@ -186 +186 @@ void IntentRecognitionService::RemoveIntentClarificationResult(const std::string
+-        LOG_INFO("[IntentRecognition] Remove IntentClarificationResult, responseId: %s", responseId.c_str());
++        LOG_DEBUG("[IntentRecognition] Remove IntentClarificationResult, responseId: %s", responseId.c_str());
+diff --git a/service/src/business/rewrite_query/rewrite_query_service.cpp b/service/src/business/rewrite_query/rewrite_query_service.cpp
+index acc00b9..a5fe222 100644
+--- a/service/src/business/rewrite_query/rewrite_query_service.cpp
++++ b/service/src/business/rewrite_query/rewrite_query_service.cpp
+@@ -484 +484 @@ std::string RewriteQueryService::RewriteQueryFromUserConversation(
+-    LOG_INFO("finish ConvertRegionByID - userId=%s, region=%s, success=%s, query=%s",
++    LOG_DEBUG("finish ConvertRegionByID - userId=%s, region=%s, success=%s, query=%s",
+diff --git a/service/src/business/rewrite_rules/rewrite_rule_service.cpp b/service/src/business/rewrite_rules/rewrite_rule_service.cpp
+index 26040b2..2f754d4 100644
+--- a/service/src/business/rewrite_rules/rewrite_rule_service.cpp
++++ b/service/src/business/rewrite_rules/rewrite_rule_service.cpp
+@@ -551 +551 @@ bool RewriteRuleService::ScalarSearchByExampleText(const std::vector<std::string
+-        LOG_INFO("ScalarSearch-ExampleText: [%s] no exact match found", queries[0].c_str());
++        LOG_DEBUG("ScalarSearch-ExampleText: [%s] no exact match found", queries[0].c_str());
+@@ -865 +865 @@ std::vector<std::shared_ptr<RuleExample>> RewriteRuleService::Recall(const std::
+-    LOG_INFO("FinalResult matched success for [%s], data detail (result_count: %zu)%s", query.c_str(), results.size(), oss.str().c_str());
++    LOG_DEBUG("FinalResult matched success for [%s], data detail (result_count: %zu)%s", query.c_str(), results.size(), oss.str().c_str());
+@@ -878 +878 @@ RewriteRuleService::SelectPromptResult RewriteRuleService::SelectPrompt(const st
+-        LOG_INFO("[%s], using default prompt: both recall and dynamic examples are empty, use default prompt", query.c_str());
++        LOG_DEBUG("[%s], using default prompt: both recall and dynamic examples are empty, use default prompt", query.c_str());
+@@ -1031 +1031 @@ std::pair<std::string, std::string> RewriteRuleService::AssemblePrompt(const Rew
+-    LOG_INFO("[%s], level=%s, system_prompt_key=%s, user_prompt_key=%s, exampleCount=%zu",
++    LOG_DEBUG("[%s], level=%s, system_prompt_key=%s, user_prompt_key=%s, exampleCount=%zu",
+diff --git a/service/src/domain/datatable/city_info_tbl.cpp b/service/src/domain/datatable/city_info_tbl.cpp
+index e3a58e1..5cf9443 100644
+--- a/service/src/domain/datatable/city_info_tbl.cpp
++++ b/service/src/domain/datatable/city_info_tbl.cpp
+@@ -41 +41 @@ bool CityInfoTbl::QueryProvinceByCityCodeInternal(const std::string& cityCode, s
+-        LOG_INFO("cityCode is empty");
++        LOG_DEBUG("cityCode is empty");
+@@ -83 +83 @@ bool CityInfoTbl::QueryProvinceByCityCodeInternal(const std::string& cityCode, s
+-        LOG_INFO("no record found for cityCode: %s", cityCode.c_str());
++        LOG_DEBUG("no record found for cityCode: %s", cityCode.c_str());
+@@ -98 +98 @@ bool CityInfoTbl::QueryProvinceByCityCodeInternal(const std::string& cityCode, s
+-    LOG_INFO("QueryProvinceByCityCode success, cityCode: %s, provinceName: %s", 
++    LOG_DEBUG("QueryProvinceByCityCode success, cityCode: %s, provinceName: %s",
+@@ -125 +125 @@ bool CityInfoTbl::ConvertRegionByID(const std::string userID, std::string& regio
+-    LOG_INFO("first extract: %s, userID: %s", firstExtract.c_str(), userID.c_str());
++    LOG_DEBUG("first extract: %s, userID: %s", firstExtract.c_str(), userID.c_str());
+@@ -135 +135 @@ bool CityInfoTbl::ConvertRegionByID(const std::string userID, std::string& regio
+-        LOG_INFO("second extract: %s, query province table", secondExtract.c_str());
++        LOG_DEBUG("second extract: %s, query province table", secondExtract.c_str());
+@@ -141 +141 @@ bool CityInfoTbl::ConvertRegionByID(const std::string userID, std::string& regio
+-        LOG_INFO("use first extract: %s, query city table", firstExtract.c_str());
++        LOG_DEBUG("use first extract: %s, query city table", firstExtract.c_str());
+diff --git a/service/src/domain/datatable/intent_keyword_tbl.cpp b/service/src/domain/datatable/intent_keyword_tbl.cpp
+index 948d9c0..b4bad8a 100644
+--- a/service/src/domain/datatable/intent_keyword_tbl.cpp
++++ b/service/src/domain/datatable/intent_keyword_tbl.cpp
+@@ -51 +51 @@ bool IntentKeywordTbl::QueryAllKeywords(std::vector<std::string>& keywords)
+-    LOG_INFO("IntentKeywordTbl: QueryAllKeywords success, count=%zu", keywords.size());
++    LOG_DEBUG("IntentKeywordTbl: QueryAllKeywords success, count=%zu", keywords.size());
+diff --git a/service/src/domain/datatable/rule_example_tbl.cpp b/service/src/domain/datatable/rule_example_tbl.cpp
+index 89f0faa..3b4dfd7 100644
+--- a/service/src/domain/datatable/rule_example_tbl.cpp
++++ b/service/src/domain/datatable/rule_example_tbl.cpp
+@@ -386 +386 @@ bool RuleExampleTbl::QueryRulesByField(const std::string& region,
+-    LOG_INFO("QueryRulesByScopedExampleText from tbl_rewrite_rule_example success, fieldName=%s, fieldValue=%s, result_count=%zu",
++    LOG_DEBUG("QueryRulesByScopedExampleText from tbl_rewrite_rule_example success, fieldName=%s, fieldValue=%s, result_count=%zu",

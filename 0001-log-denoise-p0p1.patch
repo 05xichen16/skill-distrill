@@ -1,0 +1,219 @@
+From d5eecd120013b8cda59fd86532acfb9422a5298f Mon Sep 17 00:00:00 2001
+From: xichen <xichen0516qaq@gmail.com>
+Date: Thu, 25 Jun 2026 10:58:47 +0800
+Subject: [PATCH] =?UTF-8?q?=E8=BF=90=E8=A1=8C=E6=97=A5=E5=BF=97=E9=99=8D?=
+ =?UTF-8?q?=E5=99=AA=EF=BC=9AP0/P1=20=E5=86=85=E9=83=A8=E8=AE=B0=E8=B4=A6?=
+ =?UTF-8?q?=E4=B8=8E=E6=94=B9=E5=86=99=E4=B8=AD=E9=97=B4=E6=AD=A5=E9=AA=A4?=
+ =?UTF-8?q?=20INFO=20=E9=99=8D=E7=BA=A7=20DEBUG?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+将意图识别状态记账、关键字/规则查询空结果、区域转换中间步骤等 19 处 LOG_INFO 降级为 LOG_DEBUG（6 文件）。现网 INFO 级下不再打印，预计减少我方服务运行日志约 44%。请求审计、耗时(DMContext)与异常(ERR/WARN)日志保持不变。
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../intent_recognition_service.cpp                   | 12 ++++++------
+ .../business/rewrite_query/rewrite_query_service.cpp |  2 +-
+ .../business/rewrite_rules/rewrite_rule_service.cpp  |  8 ++++----
+ service/src/domain/datatable/city_info_tbl.cpp       | 12 ++++++------
+ service/src/domain/datatable/intent_keyword_tbl.cpp  |  2 +-
+ service/src/domain/datatable/rule_example_tbl.cpp    |  2 +-
+ 6 files changed, 19 insertions(+), 19 deletions(-)
+
+diff --git a/service/src/business/intent_recognition/intent_recognition_service.cpp b/service/src/business/intent_recognition/intent_recognition_service.cpp
+index c6c16b0..9053452 100644
+--- a/service/src/business/intent_recognition/intent_recognition_service.cpp
++++ b/service/src/business/intent_recognition/intent_recognition_service.cpp
+@@ -21,7 +21,7 @@ void IntentRecognitionService::AddIntentClarificationResult(const std::string& r
+ {
+     std::lock_guard<std::mutex> lock(m_clarificationMutex);
+     m_clarificationMap[responseId] = result;
+-    LOG_INFO("[IntentRecognition] Add intent clarification result, responseId: %s", responseId.c_str());
++    LOG_DEBUG("[IntentRecognition] Add intent clarification result, responseId: %s", responseId.c_str());
+ }
+ 
+ std::shared_ptr<IntentClarificationResult> IntentRecognitionService::GetIntentClarificationResultWithoutWait(const std::string& responseId)
+@@ -41,7 +41,7 @@ void IntentRecognitionService::RecognizeIntent(const std::string& userId,
+                                               const std::string& originalContent,
+                                               const std::string& responseId)
+ {
+-    LOG_INFO("[IntentRecognition] Start intent recognition, responseId: %s", responseId.c_str());
++    LOG_DEBUG("[IntentRecognition] Start intent recognition, responseId: %s", responseId.c_str());
+     auto start = std::chrono::system_clock::now();
+     // 创建 IntentClarificationResult 对象并添加到缓存
+     auto intentResultObj = std::make_shared<IntentClarificationResult>(responseId);
+@@ -49,7 +49,7 @@ void IntentRecognitionService::RecognizeIntent(const std::string& userId,
+     
+     // 第一步：关键字检测（通过数据库查询）
+     if (!HasDeleteMemoryKeyword(originalContent)) {
+-        LOG_INFO("[IntentRecognition] No delete memory keyword found, skip.");
++        LOG_DEBUG("[IntentRecognition] No delete memory keyword found, skip.");
+         UpdateIntentClarificationResult(responseId, "None", 0);
+         return;
+     }
+@@ -136,7 +136,7 @@ std::string IntentRecognitionService::DoIntentInfer(const std::string& query)
+ 
+ void IntentRecognitionService::UpdateIntentClarificationResult(const std::string& responseId, const std::string& intentResult, const long latency)
+ {
+-    LOG_INFO("[IntentRecognition] UpdateIntentClarificationResult, responseId: %s, intentResult: %s",
++    LOG_DEBUG("[IntentRecognition] UpdateIntentClarificationResult, responseId: %s, intentResult: %s",
+              responseId.c_str(), intentResult.c_str());
+     
+     // 获取 IntentClarificationResult 并更新意图结果（不带等待，避免死锁）
+@@ -148,7 +148,7 @@ void IntentRecognitionService::UpdateIntentClarificationResult(const std::string
+             result->intentLatency = latency;
+         }
+         result->intentCv.notify_all();
+-        LOG_INFO("[IntentRecognition] IntentClarificationResult updated successfully.");
++        LOG_DEBUG("[IntentRecognition] IntentClarificationResult updated successfully.");
+     } else {
+         LOG_ERR("[IntentRecognition] IntentClarificationResult not found for responseId: %s", responseId.c_str());
+     }
+@@ -183,7 +183,7 @@ void IntentRecognitionService::RemoveIntentClarificationResult(const std::string
+     std::lock_guard<std::mutex> lock(m_clarificationMutex);
+     auto it = m_clarificationMap.find(responseId);
+     if (it != m_clarificationMap.end()) {
+-        LOG_INFO("[IntentRecognition] Remove IntentClarificationResult, responseId: %s", responseId.c_str());
++        LOG_DEBUG("[IntentRecognition] Remove IntentClarificationResult, responseId: %s", responseId.c_str());
+         m_clarificationMap.erase(it);
+     }
+ }
+diff --git a/service/src/business/rewrite_query/rewrite_query_service.cpp b/service/src/business/rewrite_query/rewrite_query_service.cpp
+index acc00b9..a5fe222 100644
+--- a/service/src/business/rewrite_query/rewrite_query_service.cpp
++++ b/service/src/business/rewrite_query/rewrite_query_service.cpp
+@@ -481,7 +481,7 @@ std::string RewriteQueryService::RewriteQueryFromUserConversation(
+     if (!success) {
+         region = DEFAULT_COMMON_PLACE_HOLDER;
+     }
+-    LOG_INFO("finish ConvertRegionByID - userId=%s, region=%s, success=%s, query=%s",
++    LOG_DEBUG("finish ConvertRegionByID - userId=%s, region=%s, success=%s, query=%s",
+              userId.c_str(), region.c_str(), success ? "true" : "false", query.c_str());
+     // 2. 标量检索策略：先进行精确匹配，如果完全匹配规则库，则直接返回改写内容
+     std::string rewrittenQuery = query;
+diff --git a/service/src/business/rewrite_rules/rewrite_rule_service.cpp b/service/src/business/rewrite_rules/rewrite_rule_service.cpp
+index 26040b2..2f754d4 100644
+--- a/service/src/business/rewrite_rules/rewrite_rule_service.cpp
++++ b/service/src/business/rewrite_rules/rewrite_rule_service.cpp
+@@ -548,7 +548,7 @@ bool RewriteRuleService::ScalarSearchByExampleText(const std::vector<std::string
+     // 标量检索不限制数量，返回最多100条结果
+     bool success = RuleExampleTbl::QueryRulesByField(region, FIELD_EXAMPLE_TEXT, queries, results, 10);
+     if (!success || results.empty()) {
+-        LOG_INFO("ScalarSearch-ExampleText: [%s] no exact match found", queries[0].c_str());
++        LOG_DEBUG("ScalarSearch-ExampleText: [%s] no exact match found", queries[0].c_str());
+         // 返回空数组
+         results.clear();
+         return false;
+@@ -862,7 +862,7 @@ std::vector<std::shared_ptr<RuleExample>> RewriteRuleService::Recall(const std::
+         }
+         oss << "------------------------------------------------------";
+     }
+-    LOG_INFO("FinalResult matched success for [%s], data detail (result_count: %zu)%s", query.c_str(), results.size(), oss.str().c_str());
++    LOG_DEBUG("FinalResult matched success for [%s], data detail (result_count: %zu)%s", query.c_str(), results.size(), oss.str().c_str());
+     return results;
+ }
+ // 根据RRF分数选择prompt和示例数据
+@@ -875,7 +875,7 @@ RewriteRuleService::SelectPromptResult RewriteRuleService::SelectPrompt(const st
+ 
+     // 规则1: 如果RuleExample结果为空且dynamicExamples也为空，则直接返回默认prompt
+     if (examples.empty() && dynamicExamples.empty()) {
+-        LOG_INFO("[%s], using default prompt: both recall and dynamic examples are empty, use default prompt", query.c_str());
++        LOG_DEBUG("[%s], using default prompt: both recall and dynamic examples are empty, use default prompt", query.c_str());
+         return selectResult;
+     }
+ 
+@@ -1028,7 +1028,7 @@ std::pair<std::string, std::string> RewriteRuleService::AssemblePrompt(const Rew
+             userPromptStr.replace(queryPos, queryPlaceholder.length(), query);
+         }
+     }
+-    LOG_INFO("[%s], level=%s, system_prompt_key=%s, user_prompt_key=%s, exampleCount=%zu",
++    LOG_DEBUG("[%s], level=%s, system_prompt_key=%s, user_prompt_key=%s, exampleCount=%zu",
+              query.c_str(), promptLevel.c_str(), systemPromptKey.c_str(), userPromptKey.c_str(), examples.size());
+     return std::make_pair(userPromptStr, systemPrompt);
+ }
+diff --git a/service/src/domain/datatable/city_info_tbl.cpp b/service/src/domain/datatable/city_info_tbl.cpp
+index e3a58e1..5cf9443 100644
+--- a/service/src/domain/datatable/city_info_tbl.cpp
++++ b/service/src/domain/datatable/city_info_tbl.cpp
+@@ -38,7 +38,7 @@ bool CityInfoTbl::QueryProvinceByCityCodeInternal(const std::string& cityCode, s
+ {
+     // 参数校验：城市编码不能为空
+     if (cityCode.empty()) {
+-        LOG_INFO("cityCode is empty");
++        LOG_DEBUG("cityCode is empty");
+         provinceName.clear();
+         return false;
+     }
+@@ -80,7 +80,7 @@ bool CityInfoTbl::QueryProvinceByCityCodeInternal(const std::string& cityCode, s
+ 
+     // 处理查询结果
+     if (queryResult.empty() || queryResult[0].empty()) {
+-        LOG_INFO("no record found for cityCode: %s", cityCode.c_str());
++        LOG_DEBUG("no record found for cityCode: %s", cityCode.c_str());
+         provinceName.clear();
+         return false;
+     }
+@@ -95,7 +95,7 @@ bool CityInfoTbl::QueryProvinceByCityCodeInternal(const std::string& cityCode, s
+         return false;
+     }
+ 
+-    LOG_INFO("QueryProvinceByCityCode success, cityCode: %s, provinceName: %s", 
++    LOG_DEBUG("QueryProvinceByCityCode success, cityCode: %s, provinceName: %s",
+              cityCode.c_str(), provinceName.c_str());
+     return true;
+ }
+@@ -122,7 +122,7 @@ bool CityInfoTbl::ConvertRegionByID(const std::string userID, std::string& regio
+     firstExtract += userID[5];  // 第6位
+     firstExtract += userID[6];  // 第7位
+ 
+-    LOG_INFO("first extract: %s, userID: %s", firstExtract.c_str(), userID.c_str());
++    LOG_DEBUG("first extract: %s, userID: %s", firstExtract.c_str(), userID.c_str());
+ 
+     // 判断第一次提取结果是否等于"6666"
+     if (firstExtract == "6666") {
+@@ -132,13 +132,13 @@ bool CityInfoTbl::ConvertRegionByID(const std::string userID, std::string& regio
+         secondExtract += userID[8];  // 第9位
+         secondExtract += userID[9];  // 第10位
+ 
+-        LOG_INFO("second extract: %s, query province table", secondExtract.c_str());
++        LOG_DEBUG("second extract: %s, query province table", secondExtract.c_str());
+ 
+         // 通过省份表查询
+         return ProvinceInfoTbl::QueryProvinceByProvinceCode(secondExtract, region);
+     } else {
+         // 非6666场景：直接使用第一次提取的4位字符串，通过地市表查询
+-        LOG_INFO("use first extract: %s, query city table", firstExtract.c_str());
++        LOG_DEBUG("use first extract: %s, query city table", firstExtract.c_str());
+ 
+         // 通过地市表查询
+         return QueryProvinceByCityCodeInternal(firstExtract, region);
+diff --git a/service/src/domain/datatable/intent_keyword_tbl.cpp b/service/src/domain/datatable/intent_keyword_tbl.cpp
+index 948d9c0..b4bad8a 100644
+--- a/service/src/domain/datatable/intent_keyword_tbl.cpp
++++ b/service/src/domain/datatable/intent_keyword_tbl.cpp
+@@ -48,7 +48,7 @@ bool IntentKeywordTbl::QueryAllKeywords(std::vector<std::string>& keywords)
+         }
+     }
+     
+-    LOG_INFO("IntentKeywordTbl: QueryAllKeywords success, count=%zu", keywords.size());
++    LOG_DEBUG("IntentKeywordTbl: QueryAllKeywords success, count=%zu", keywords.size());
+     return true;
+ }
+ 
+diff --git a/service/src/domain/datatable/rule_example_tbl.cpp b/service/src/domain/datatable/rule_example_tbl.cpp
+index 89f0faa..3b4dfd7 100644
+--- a/service/src/domain/datatable/rule_example_tbl.cpp
++++ b/service/src/domain/datatable/rule_example_tbl.cpp
+@@ -383,7 +383,7 @@ bool RuleExampleTbl::QueryRulesByField(const std::string& region,
+         results.push_back(ruleExampleResult);
+     }
+ 
+-    LOG_INFO("QueryRulesByScopedExampleText from tbl_rewrite_rule_example success, fieldName=%s, fieldValue=%s, result_count=%zu",
++    LOG_DEBUG("QueryRulesByScopedExampleText from tbl_rewrite_rule_example success, fieldName=%s, fieldValue=%s, result_count=%zu",
+              fieldName.c_str(), fieldValues[0].c_str(), results.size());
+     return true;
+ }
+-- 
+2.54.0.windows.1
+
